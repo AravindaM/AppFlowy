@@ -4,7 +4,7 @@
 
 **Goal:** Prove AppFlowy's live per-user data dir can be snapshotted to a byte-identical, openable, referentially-consistent copy while the app runs, and land the WAL prerequisite that makes it safe.
 
-**Architecture:** Fix the SQLite WAL pragma so it actually applies, then build a `SnapshotService` that, under a short write barrier, copies `flowy-database.db` via `VACUUM INTO` and `collab_db/` via a RocksDB checkpoint into a staging dir, and restores it back. This plan stops at the local snapshot↔restore round-trip — no Drive, no UI. It contains the make-or-break spike (RocksDB checkpoint reachability); Plans 2–5 depend on this passing.
+**Architecture:** Fix the SQLite WAL pragma so it actually applies, then build a `SnapshotService` that, inside the app's quiesce window, copies `flowy-database.db` via `VACUUM INTO` and `collab_db/` via **Drop-and-Copy** (close the RocksDB handle → copy the quiescent dir → reopen) into a staging dir, and restores it back. This plan stops at the local snapshot↔restore round-trip — no Drive, no UI. It contains the make-or-break spike (drop-and-copy correctness incl. WAL-replay); Plans 2–5 depend on this passing.
 
 **Tech Stack:** Rust, Diesel/rusqlite (`flowy-sqlite`), `collab-plugins` `CollabKVDB` (RocksDB), `collab-integrate`.
 
@@ -13,8 +13,10 @@
 - Desktop only (macOS / Windows / Linux).
 - No new behavior in Local vs Cloud mode beyond snapshotting the local data dir.
 - Data dir layout: `{app_data_dir}/{uid}/flowy-database.db`, `{app_data_dir}/{uid}/collab_db/`. Exclude `indexes/` and `cache_files/` from snapshots.
-- Cross-DB consistency is guaranteed by a **write barrier**, not by copy ordering.
-- No fabricated APIs: Task 2 Step 1 is a discovery gate — the exact RocksDB checkpoint call is found in the pinned `collab-plugins` source before any snapshot code is written against it.
+- **collab_db snapshot mechanism = Drop-and-Copy** (decided 2026-07-16 after the first spike disproved live-checkpoint). `collab_db` has no reachable live-snapshot primitive; a consistent copy requires the RocksDB handle to be fully closed (quiescent) first, then byte-copy, then reopen. Copying an open `collab_db` dir is UNSAFE (background compaction tears the SST set). `CollabKVDB::flush()` is a no-op — do not rely on it.
+- Cross-DB consistency is guaranteed by a **quiesce window** (writers paused, `collab_db` handle closed) that spans both stores' copies, not by copy ordering.
+- **Fork constraint (hard):** this repo is a merge-friendly fork of upstream AppFlowy. Keep new code in the `flowy-backup` crate; do NOT rename upstream symbols; do NOT fork external deps (`collab-plugins`, `rust-rocksdb`). Plan 1 stays entirely within `flowy-backup` plus the one-line WAL fix already landed in Task 0.
+- Plan 1 scope note: it proves drop-and-copy correctness given **exclusive ownership of the handle** (the test controls all refs). The app-wide quiesce orchestration (coordinating the ~10 `Weak<CollabKVDB>` holders + pausing editing) is a Plan 2 integration task, not Plan 1.
 - Pinned deps: `rocksdb` rev `1710120e4549e04ba3baa6a1ee5a5a801fa45a72`, `collab-plugins` git rev `4dfccef` (see root `Cargo.toml`).
 
 ---
@@ -188,99 +190,100 @@ git commit -m "feat(backup): scaffold flowy-backup crate and SnapshotService int
 
 ---
 
-### Task 2: SPIKE — RocksDB checkpoint of a live `collab_db` (the gate)
+### Task 2: SPIKE — Drop-and-Copy snapshot of `collab_db` (the gate)
 
-**This task decides whether the whole directory-snapshot approach is viable. Do not proceed to Plan 2+ until Step 6 passes.**
+**This task proves the snapshot mechanism is correct. Do not proceed to Plan 2+ until Step 5 passes with a REALISTIC test (not the hollow pattern the first attempt failed on).**
+
+Decision already made (see Global Constraints): live-checkpoint is unreachable; the mechanism is **Drop-and-Copy** — the `collab_db` RocksDB handle must be fully dropped (closed) so RocksDB syncs its WAL and stops all background threads, THEN the quiescent directory is byte-copied, THEN reopened. A reopened copy replays the WAL, so committed data survives. There is no concurrent writer during the copy by construction (the handle is closed), which is exactly why it's safe.
 
 **Files:**
 - Modify: `frontend/rust-lib/flowy-backup/src/snapshot.rs`
-- Modify: `frontend/rust-lib/flowy-backup/Cargo.toml` (add `collab-integrate`, `collab-plugins` deps once the API is known)
-- Test: `frontend/rust-lib/flowy-backup/tests/checkpoint_spike.rs`
+- Modify: `frontend/rust-lib/flowy-backup/Cargo.toml` (add `collab-integrate` — which re-exports `CollabKVDB` — and any needed collab crates; match workspace dep conventions)
+- Test: `frontend/rust-lib/flowy-backup/tests/collab_db_snapshot_spike.rs`
 
 **Interfaces:**
-- Consumes: `CollabKVDB` from `collab-integrate` / `collab-plugins`.
-- Produces: `fn checkpoint_collab_db(collab_db_path: &Path, out_dir: &Path) -> Result<(), BackupError>`.
+- Consumes: `CollabKVDB` from `collab_integrate` (`use collab_integrate::CollabKVDB;`), opened via `CollabKVDB::open(&path)`; write via `db.with_write_txn(|txn| ...)`; read via `db.read_txn()` (see `flowy-user/src/services/db.rs` and `flowy-user/src/migrations/*.rs` for exact `KVStore`/txn method shapes).
+- Produces: `fn snapshot_closed_collab_db(collab_db_path: &Path, out_dir: &Path) -> Result<(), BackupError>` — a recursive directory copy that is **only correct when no `CollabKVDB` handle is open on `collab_db_path`**. Its doc comment MUST state that precondition (the app-wide quiesce that guarantees it is a Plan 2 concern).
 
-- [ ] **Step 1: DISCOVERY (no code yet) — find the checkpoint API**
+- [ ] **Step 1: Add deps and write the REALISTIC failing spike test**
 
-Read the pinned `collab-plugins` source to answer, in writing, in the commit message of Step 5:
-1. Does `CollabKVDB` (or the underlying `KVTransactionDB` / RocksDB store) expose a checkpoint / backup / flush API? Names and signatures.
-2. Does the pinned `rust-rocksdb` rev expose `rocksdb::checkpoint::Checkpoint`? (Check the vendored/pinned crate.)
-3. Can a checkpoint be taken from the **live, open** handle the app holds, or does it require a fresh handle on the dir (RocksDB single-writer lock)?
+The test must avoid the two flaws that sank the first attempt: (a) it must NOT keep a handle open during the copy — it drops it; (b) it must write enough data that a reopened copy genuinely exercises WAL replay / on-disk state, and it must assert that the **last write committed immediately before the drop** is present in the copy.
 
-Commands:
-```bash
-cargo tree -p flowy-backup -i collab-plugins   # confirm resolution
-find ~/.cargo -path '*collab-plugins*/src*' -name '*.rs' | xargs grep -ln 'checkpoint\|Checkpoint\|flush\|RocksdbBackup' 2>/dev/null
-find ~/.cargo -path '*rocksdb*/src*' -name 'checkpoint*.rs' 2>/dev/null
-```
-
-Decision gate:
-- If a checkpoint/flush path exists → continue to Step 2.
-- If it does **not** → STOP. Record findings and escalate: the design must switch to "flush + copy under an exclusive txn" or "quiesce + plain dir copy". Do not fake a passing test.
-
-- [ ] **Step 2: Write the failing spike test**
-
-`frontend/rust-lib/flowy-backup/tests/checkpoint_spike.rs`:
+`frontend/rust-lib/flowy-backup/tests/collab_db_snapshot_spike.rs`:
 
 ```rust
-// Opens a CollabKVDB, writes a document, spawns a thread writing continuously,
-// takes a checkpoint into out_dir, then opens the checkpoint as a fresh
-// CollabKVDB and asserts the first document reads back identically.
-//
-// The exact CollabKVDB open/write/read calls are filled from Step 1 discovery;
-// use collab-integrate's CollabPersistenceImpl / with_write_txn / read_txn as
-// seen in flowy-user/src/migrations/*.rs for the real call shapes.
+use collab_integrate::CollabKVDB;
+use flowy_backup::snapshot::snapshot_closed_collab_db;
+use std::sync::Arc;
+
+// Helper write/read using the real KVStore txn API (fill exact method names
+// from flowy-user/src/services/db.rs + migrations/*.rs during implementation).
+fn write_doc(db: &Arc<CollabKVDB>, uid: i64, object_id: &str, bytes: &[u8]) { /* with_write_txn insert */ }
+fn read_doc(db: &Arc<CollabKVDB>, uid: i64, object_id: &str) -> Option<Vec<u8>> { /* read_txn get */ }
+
 #[test]
-fn checkpoint_of_live_collab_db_restores_identically() {
-  // 1. open source CollabKVDB at src_dir
-  // 2. write doc "obj-1" with known bytes
-  // 3. spawn writer thread hammering "obj-churn" until a stop flag
-  // 4. checkpoint_collab_db(src_dir, out_dir)
-  // 5. stop writer
-  // 6. open CollabKVDB at out_dir, read "obj-1", assert bytes equal
-  todo!("fill from Step 1 discovery")
+fn dropped_collab_db_copies_and_reopens_identically() {
+  let root = tempfile::tempdir().unwrap();
+  let src = root.path().join("collab_db");
+  let out = root.path().join("collab_db_copy");
+  let uid = 1;
+
+  // 1. open, write MANY docs so real SST/WAL state exists (e.g. 2_000 docs of ~1KB)
+  let db = Arc::new(CollabKVDB::open(&src).unwrap());
+  for i in 0..2_000 { write_doc(&db, uid, &format!("obj-{i}"), &vec![(i % 251) as u8; 1024]); }
+  // 2. the CRITICAL last write, committed right before the drop:
+  write_doc(&db, uid, "obj-final", b"the-last-committed-bytes");
+
+  // 3. DROP all handles -> RocksDB closes, syncs WAL, stops background threads
+  assert_eq!(Arc::strong_count(&db), 1, "test must hold the only ref before drop");
+  drop(db);
+
+  // 4. copy the now-quiescent dir
+  snapshot_closed_collab_db(&src, &out).unwrap();
+
+  // 5. reopen the COPY and assert both an early doc and the last-committed doc survive
+  let copy = Arc::new(CollabKVDB::open(&out).unwrap());
+  assert_eq!(read_doc(&copy, uid, "obj-0").as_deref(), Some(&vec![0u8; 1024][..]));
+  assert_eq!(read_doc(&copy, uid, "obj-final").as_deref(), Some(&b"the-last-committed-bytes"[..]));
 }
 ```
 
-- [ ] **Step 3: Run test to verify it fails**
+- [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p flowy-backup --test checkpoint_spike`
-Expected: FAIL / panic on `todo!` — proves the harness is wired.
+Run: `cargo test -p flowy-backup --test collab_db_snapshot_spike`
+Expected: FAIL — `snapshot_closed_collab_db` not implemented (and helper bodies todo).
 
-- [ ] **Step 4: Implement `checkpoint_collab_db` using the discovered API**
+- [ ] **Step 3: Implement `snapshot_closed_collab_db` + fill the helpers**
 
-Fill `checkpoint_collab_db` in `snapshot.rs` with the real call found in Step 1 (RocksDB `Checkpoint::create`, or the collab-plugins backup API). Fill the test body with real `CollabKVDB` calls.
+Implement a recursive directory copy (create `out_dir`, copy every file/subdir from `collab_db_path`). Fill `write_doc`/`read_doc` with the real `CollabKVDB` transaction API discovered from `flowy-user/src/services/db.rs` and `migrations/*.rs`. Add a doc comment on `snapshot_closed_collab_db` stating the "no open handle" precondition.
 
-- [ ] **Step 5: Run the spike to verify it passes**
+- [ ] **Step 4: Run the spike to verify it passes**
 
-Run: `cargo test -p flowy-backup --test checkpoint_spike -- --nocapture`
-Expected: PASS — checkpoint taken while a writer runs restores `obj-1` identically.
+Run: `cargo test -p flowy-backup --test collab_db_snapshot_spike -- --nocapture`
+Expected: PASS — the dropped-then-copied DB reopens with both `obj-0` and `obj-final` intact (proves WAL/state fully persisted on drop and the copy is complete).
 
-- [ ] **Step 6: GATE + commit**
+- [ ] **Step 5: GATE + commit**
 
-If PASS, commit with the discovery findings in the message:
+If PASS, commit:
 
 ```bash
 git add frontend/rust-lib/flowy-backup/
-git commit -m "spike(backup): prove live collab_db RocksDB checkpoint restores identically
-
-Findings: <checkpoint API used>, <live-handle vs fresh-handle>, <memtable/WAL flush needs>."
+git commit -m "spike(backup): prove drop-and-copy of closed collab_db reopens with all committed data"
 ```
 
-If FAIL and unfixable within 3 attempts → STOP, escalate to redesign per the spec's residual-risk path. Do not continue.
+If the last-committed doc is MISSING after reopen, drop-and-copy on a bare drop is insufficient (WAL not synced on drop) — STOP and escalate: the next option is an explicit close/flush API or forcing a WAL sync before drop. Do not paper over it. Max 3 attempts, then escalate.
 
 ---
 
-### Task 3: SQLite `VACUUM INTO` + write-barrier snapshot
+### Task 3: SQLite `VACUUM INTO` + full snapshot assembly
 
 **Files:**
 - Modify: `frontend/rust-lib/flowy-backup/src/snapshot.rs`
 - Test: `frontend/rust-lib/flowy-backup/tests/snapshot_roundtrip.rs`
 
 **Interfaces:**
-- Consumes: `checkpoint_collab_db` (Task 2), a SQLite connection source.
-- Produces: `fn snapshot_sqlite(db_path: &Path, out_path: &Path) -> Result<(), BackupError>` and the full `SnapshotService::snapshot(...)` body that (a) takes the write barrier, (b) VACUUM INTOs SQLite, (c) checkpoints collab_db, (d) computes sha256 checksums, (e) returns `SnapshotManifest`.
+- Consumes: `snapshot_closed_collab_db` (Task 2), a SQLite connection source.
+- Produces: `fn snapshot_sqlite(db_path: &Path, out_path: &Path) -> Result<(), BackupError>` and the full `SnapshotService::snapshot(...)` body that (a) assumes it runs inside the app's quiesce window with the `collab_db` handle already closed, (b) VACUUM INTOs SQLite, (c) copies the closed `collab_db` via `snapshot_closed_collab_db`, (d) computes sha256 checksums, (e) returns `SnapshotManifest`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -324,9 +327,9 @@ pub fn snapshot_sqlite(db_path: &Path, out_path: &Path) -> Result<(), BackupErro
 Run: `cargo test -p flowy-backup --test snapshot_roundtrip`
 Expected: PASS — WAL-resident row is captured in the vacuumed copy.
 
-- [ ] **Step 5: Implement `SnapshotService::snapshot` (barrier + both DBs + checksums)**
+- [ ] **Step 5: Implement `SnapshotService::snapshot` (both DBs + checksums)**
 
-Assemble VACUUM INTO + `checkpoint_collab_db` into a staging dir, sha256 each output, return `SnapshotManifest`. The write barrier is passed in as a closure/guard by the caller (BackupManager, Plan 4) so this crate stays free of app-global locks; document the invariant that `snapshot` must be called inside the barrier.
+Assemble `snapshot_sqlite` (VACUUM INTO) + `snapshot_closed_collab_db` into a staging dir, sha256 each output, return `SnapshotManifest`. This crate stays free of app-global locks: the app-wide quiesce (pausing writers + closing the `collab_db` handle) is the caller's responsibility (BackupManager / Plan 2). Document the precondition on `snapshot` in its doc comment: **callers must have paused SQLite writers and closed the `collab_db` handle before calling.**
 
 - [ ] **Step 6: Commit**
 
@@ -387,9 +390,9 @@ git commit -m "feat(backup): restore snapshot into target dir with checksum veri
 
 ## Self-Review
 
-- **Spec coverage (this plan's slice):** WAL prereq (Task 0) ✓; snapshot core / VACUUM INTO + checkpoint under write barrier (Tasks 2–3) ✓; checksum verification (Tasks 3–4) ✓; local restore round-trip (Task 4) ✓. Deferred to later plans (explicitly out of Plan 1 scope): Drive client/OAuth/manifest-last, staged restore-on-launch boot path, 2a guardrail persistence, retention/backoff, Flutter UI. These are named in the spec's Implementation Sequencing §2–6.
+- **Spec coverage (this plan's slice):** WAL prereq (Task 0) ✓; snapshot core / VACUUM INTO + collab_db drop-and-copy in the quiesce window (Tasks 2–3) ✓; checksum verification (Tasks 3–4) ✓; local restore round-trip (Task 4) ✓. Deferred to later plans (explicitly out of Plan 1 scope): app-wide quiesce orchestration (closing the ~10 `Weak<CollabKVDB>` holders + pausing editing), Drive client/OAuth/manifest-last, staged restore-on-launch boot path, 2a guardrail persistence, retention/backoff, Flutter UI. These are named in the spec's Implementation Sequencing §2–6.
 - **Placeholder scan:** the only intentional `todo!`/discovery points are in the Task 2 spike, which is by nature an investigation; every other step carries real code or a real command. Task 0 Step 1 flags that constructor names must be confirmed against `pool.rs`.
-- **Type consistency:** `SnapshotService`, `SnapshotManifest`, `BackupError`, `checkpoint_collab_db`, `snapshot_sqlite`, `snapshot`, `restore` names are used consistently across Tasks 1–4.
+- **Type consistency:** `SnapshotService`, `SnapshotManifest`, `BackupError`, `snapshot_closed_collab_db`, `snapshot_sqlite`, `snapshot`, `restore` names are used consistently across Tasks 1–4.
 
 ## Gate
 

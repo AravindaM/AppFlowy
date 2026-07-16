@@ -20,7 +20,12 @@ Established by codebase exploration:
 - User content lives as CRDTs in `{app_data_dir}/{uid}/collab_db/` (a **RocksDB** KV store, `CollabKVDB`) plus relational metadata in `{app_data_dir}/{uid}/flowy-database.db` (**SQLite**, via Diesel).
 - There is **no document-level storage abstraction** Drive could plug into. The only S3-like trait (`StorageCloudService`, `flowy-storage-pub/src/cloud.rs`) covers **file attachments only** and is disabled in Local mode.
 - Therefore "swap the backend to Drive" is impossible. The only viable mechanism is snapshotting the **data directory itself** in and out of Drive.
-- The data is only unlocked-consistent when copied via the right primitives: RocksDB `Checkpoint` (consistent copy of a live, open DB via hard links) and SQLite `VACUUM INTO` (consistent copy of a live WAL-mode DB). The collab builder already exposes a `RocksdbBackup` trait hook (`collab-integrate/src/collab_builder.rs`).
+- Consistent-copy primitive per store: SQLite `VACUUM INTO` (safe on a live WAL DB); `collab_db` (RocksDB) has **no reachable live-snapshot primitive** through AppFlowy's `collab-plugins` fork, so it uses **Drop-and-Copy** (close the handle → copy quiescent dir → reopen). See the collab_db mechanism section for the full rationale. (The `RocksdbBackup` hook in `collab-integrate/src/collab_builder.rs` is dead, doc-level-only code — not a full-DB snapshot.)
+
+**Fork constraints (hard — this repo is a merge-friendly fork of upstream AppFlowy):**
+- Keep custom work in **new, separate crates/modules** (`flowy-backup`); avoid editing upstream files where an additive hook works instead.
+- **Do not rename** upstream symbols/files.
+- **Do not fork external dependencies** (`AppFlowy-Collab`/`collab-plugins`, `rust-rocksdb`) — this is why the native-checkpoint-via-FFI approach was rejected in favor of Drop-and-Copy, which needs no dependency changes.
 
 ## Non-Goals (v1)
 
@@ -37,7 +42,7 @@ New Rust crate **`flowy-backup`** under `frontend/rust-lib/`, composed of three 
 
 | Unit | Responsibility | Depends on |
 |------|----------------|------------|
-| `SnapshotService` | Build a consistent on-disk snapshot of the data dir; consume a snapshot on restore | RocksDB checkpoint, SQLite `VACUUM INTO`, zip |
+| `SnapshotService` | Build a consistent on-disk snapshot of the data dir; consume a snapshot on restore | collab_db drop-and-copy, SQLite `VACUUM INTO`, zip |
 | `DriveClient` | Google Drive REST v3: OAuth, resumable upload, download, list, delete | HTTP client, OS keychain |
 | `BackupManager` | Orchestrate backup/restore flows; own manifest + version logic + guardrail | `SnapshotService`, `DriveClient` |
 
@@ -48,16 +53,23 @@ The Flutter layer provides UI only: a **"Back up to Drive"** button, a **"Restor
 **Backup unit:** the whole per-user data dir `{app_data_dir}/{uid}/`. All workspaces for the account travel together.
 
 **Included in a snapshot:**
-- `flowy-database.db` — copied via `VACUUM INTO` (consistent, WAL-safe).
-- `collab_db/` — copied via RocksDB `Checkpoint::create` from the live handle.
+- `flowy-database.db` — copied via `VACUUM INTO` (consistent; SQLite has no background mutators, so a live consistent copy is safe once WAL is genuinely on).
+- `collab_db/` — copied via **Drop-and-Copy** (see below). The originally-assumed live `Checkpoint::create` is **not reachable** and has been removed from the design.
 
 **Excluded:**
 - `indexes/` — Tantivy full-text index, rebuilds on next app open.
 - `cache_files/` — transient upload staging.
 
-**Write-quiescing (cross-DB consistency — review blocker 3):** SQLite and RocksDB are two independent stores; snapshotting them at two different instants while the app writes can capture a `collab_db` document whose `flowy-database.db` metadata (or vice versa) does not exist yet, producing a referentially inconsistent snapshot. The snapshot must therefore be taken with writes quiesced: acquire a short app-level write barrier, then in one quiesced window run `VACUUM INTO` (SQLite) and `Checkpoint::create` (RocksDB), then release. Both copies are fast (checkpoint is hard-link based), so the pause is brief. Order is fixed and documented; the barrier — not the ordering — is what guarantees consistency.
+**collab_db mechanism — Drop-and-Copy (supersedes the spec's original live-checkpoint assumption).** Investigation (Plan-1 spike, 2026-07-16) established that AppFlowy's `collab-plugins` fork does **not** expose a usable live snapshot of `collab_db`:
+- `CollabKVDB` hides its inner `rocksdb::TransactionDB` (private, no getter/Deref), so RocksDB's native `Checkpoint`/`BackupEngine` cannot be reached, and `rust-rocksdb`'s `Checkpoint` requires a trait `TransactionDB` does not implement.
+- `CollabKVDB::flush()` is a **no-op** (`kv_impl.rs`), so "flush then copy" flushes nothing.
+- Byte-copying the directory while the handle is open is **unsafe** — RocksDB background compaction/flush threads mutate SST files independently of user write transactions, producing a torn snapshot. (Note: AppFlowy's *existing* `db.rs` zip-backup does exactly this open-dir copy and is therefore unsafe for recovery.)
 
-**Prerequisite — WAL must actually be enabled (review blocker 1):** `flowy-sqlite/src/sqlite_impl/pool.rs:148` currently sets the journal-mode pragma only `if journal_mode != WAL`; since WAL is the default value the pragma never runs and the DB is effectively in DELETE mode. `VACUUM INTO` under concurrent writers is only well-behaved in WAL mode. Fixing this pragma to run unconditionally is a prerequisite task, landed and verified before any snapshot work.
+The only mechanism that is both correct and does not require forking an external dependency (a hard constraint — see "Fork constraints" below) is to make the store **quiescent** before copying: drop **all** `Arc<CollabKVDB>` references for the user so the handle fully closes (RocksDB syncs its WAL and stops all background threads on clean close), byte-copy the now-static directory, then reopen. A reopened copy replays the WAL, so all committed data is present. This blocks collaborative editing for the duration (close + copy + reopen — seconds, scaling with `collab_db` size), which is acceptable for a **manual** backup button.
+
+**Quiesce coordination = the cross-DB consistency barrier (review blocker 3).** The same quiesce window that closes `collab_db` also pauses SQLite writers and runs `VACUUM INTO`, so both stores are captured with no writes in flight between them — no `collab_db` document whose `flowy-database.db` metadata is missing. The barrier — not copy ordering — guarantees consistency.
+
+**Prerequisite — WAL must actually be enabled (review blocker 1):** `flowy-sqlite/src/sqlite_impl/pool.rs` currently sets the journal-mode pragma only `if journal_mode != WAL`; since WAL is the default value the pragma never runs and the DB is effectively in DELETE mode. Fixed in Plan-1 Task 0 (pragma now unconditional).
 
 **Snapshot artifact:** a temp dir assembled from the above, zipped to `appflowy-snapshot-{uid}-v{N}-{deviceId}.zip`. Snapshots are atomic — assembled fully in a temp location, then finalized; a crash mid-build leaves no half-written artifact.
 
@@ -90,7 +102,7 @@ The Flutter layer provides UI only: a **"Back up to Drive"** button, a **"Restor
 1. User clicks **Back up to Drive**.
 2. Run the 2a guardrail check (see below); if Drive is newer, prompt.
 3. Verify Drive folder/manifest accessibility (by pinned file ID).
-4. `SnapshotService` builds a consistent snapshot under the write barrier (VACUUM INTO + RocksDB checkpoint) → zip.
+4. `SnapshotService` builds a consistent snapshot in one quiesce window (pause writers + `VACUUM INTO` SQLite; close `collab_db` handle + copy quiescent dir + reopen) → zip.
 5. `DriveClient` reads current Drive `manifest.json`, computes next `version = N+1`.
 6. Resumable-upload the zip **first** and confirm it is fully committed.
 7. **Manifest is written last, as the single source of truth (review blocker 4).** The version only advances when the manifest update succeeds; a zip that exists without a manifest pointing at it is ignored and GC'd. Crash between zip-upload and manifest-write leaves the previous consistent manifest intact — no orphaned version, no monotonicity break.
@@ -130,7 +142,7 @@ Mechanism (**soft version-check warning**):
 - **Rate limits, quota, session expiry (review medium 9):** the `DriveClient` implements exponential backoff with jitter on `403 rateLimitExceeded` / `429` and `5xx`; distinguishes transient (retry) from permanent (quota full, auth revoked) failures with distinct user-facing messages; and detects resumable-session expiry (Drive sessions are not indefinitely valid), restarting the session rather than reporting a false success. A backup is only reported successful once the manifest is committed.
 - Restore is transactional around the safety snapshot: checksum verified before any swap; roll back on post-swap failure.
 - OAuth token expiry → silent refresh. Revoked/invalid auth → re-prompt the connect flow.
-- Snapshot build failure (e.g. checkpoint error) → surface to user, no partial artifact left, no manifest change.
+- Snapshot build failure (e.g. copy/reopen error) → surface to user, ensure `collab_db` is reopened, no partial artifact left, no manifest change.
 - **Disk hygiene (review medium 10):** safety snapshots and staging dirs are cleaned up after successful restore and on an age/count policy, so repeated failed restores don't exhaust disk.
 
 ## Implementation Sequencing
@@ -138,8 +150,8 @@ Mechanism (**soft version-check warning**):
 Ordered so the riskiest assumption is proven before any UI, Drive, or product work is built on top of it.
 
 0. **Prerequisite:** fix the WAL pragma (`flowy-sqlite/src/sqlite_impl/pool.rs:148`) to run unconditionally; verify `PRAGMA journal_mode` actually returns `wal` at runtime.
-1. **Spike — prove the snapshot core (review high 5, gates everything).** Verify AppFlowy's pinned `rust-rocksdb` rev exposes the `Checkpoint` API; then, with a live app writing continuously, take a quiesced `VACUUM INTO` + `Checkpoint::create` snapshot and prove it restores to a byte-identical, openable, referentially-consistent state under a TDD harness. If this fails, the whole directory-snapshot approach must be reconsidered before more is built — do not proceed past this gate on assumption.
-2. `SnapshotService` (snapshot + restore-staging, write barrier, checksums) — local only, no Drive.
+1. **Spike — prove the snapshot core (gates everything). RESOLVED 2026-07-16:** the live-checkpoint assumption was disproven; mechanism is now **Drop-and-Copy**. The remaining spike work is to prove drop-and-copy correctness under a *realistic* TDD harness: seed a non-trivial `collab_db` (enough data to trigger RocksDB background compaction), write data, drop all handles, copy the quiescent dir, reopen the copy, and assert data (including writes committed immediately before the drop, i.e. WAL-replay) is byte-identical. The test must NOT be the hollow "serialized writer / tiny DB" pattern that the first spike failed on.
+2. `SnapshotService` (snapshot + restore-staging, quiesce coordination, checksums) — local only, no Drive.
 3. Staged restore-on-launch boot path + `restore-pending` marker + safety snapshot + rollback.
 4. `DriveClient` (OAuth/PKCE, resumable upload, download, list, delete, backoff) against a mock, then real Drive.
 5. `BackupManager` (manifest-last ordering, version/guardrail, retention, accessibility check).
