@@ -10,6 +10,7 @@ sha2 = "0.10"
 tempfile.workspace = true
 collab-integrate.workspace = true
 collab-plugins.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
