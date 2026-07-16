@@ -145,11 +145,28 @@ impl DatabaseCustomizer {
 impl CustomizeConnection<SqliteConnection, crate::sqlite_impl::Error> for DatabaseCustomizer {
   fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<()> {
     conn.pragma_set_busy_timeout(self.config.busy_timeout)?;
-    if self.config.journal_mode != SQLiteJournalMode::WAL {
-      conn.pragma_set_journal_mode(self.config.journal_mode, None)?;
-    }
+    conn.pragma_set_journal_mode(self.config.journal_mode, None)?;
     conn.pragma_set_synchronous(self.config.synchronous, None)?;
 
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod wal_tests {
+  use super::*;
+  use crate::sqlite_impl::pragma::PragmaExtension;
+
+  #[test]
+  fn every_acquired_conn_is_in_wal_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = format!(
+      "sqlite://{}",
+      dir.path().join("test.db").to_string_lossy()
+    );
+    let pool = ConnectionPool::new(PoolConfig::default(), &db_path).unwrap();
+    let mut conn = pool.get().unwrap();
+    let mode = conn.pragma_get_journal_mode(None).unwrap();
+    assert_eq!(mode, SQLiteJournalMode::WAL);
   }
 }
