@@ -2,6 +2,7 @@
 members = [
   "lib-dispatch",
   "lib-log",
+  "flowy-backup",
   "flowy-core",
   "dart-ffi",
   "flowy-user",
@@ -68,6 +69,8 @@ flowy-ai-pub = { path = "flowy-ai-pub" }
 anyhow = "1.0"
 arc-swap = "1.7"
 tracing = "0.1.40"
+thiserror = "1.0"
+tempfile = "3"
 bytes = "1.5.0"
 serde_json = "1.0.108"
 serde = "1.0.194"
