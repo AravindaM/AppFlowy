@@ -67,6 +67,66 @@ impl SnapshotService {
 
     Ok(SnapshotManifest { checksums })
   }
+
+  /// Restores a snapshot from a staging directory into a target user directory,
+  /// verifying checksums for each restored file against the manifest.
+  ///
+  /// This function copies `flowy-database.db` and `collab_db/` from the staging
+  /// directory into the target directory, then re-verifies each file's sha256
+  /// checksum against the provided manifest. If any checksum mismatch is detected,
+  /// the restoration fails with an error and the target state is undefined.
+  ///
+  /// **Staging semantics:** This function only copies files; the actual atomic
+  /// swap into the live app directories is a launch-time concern (Plan 2).
+  ///
+  /// # Arguments
+  /// * `staging_dir` - Source directory containing the snapshot (produced by `snapshot()`)
+  /// * `target_dir` - Target directory where files will be copied (should be empty or non-existent)
+  /// * `manifest` - `SnapshotManifest` containing expected checksums for verification
+  ///
+  /// # Returns
+  /// `Ok(())` if restoration succeeds and all checksums match, or an error otherwise.
+  /// On checksum mismatch, returns `BackupError::Snapshot` with a message identifying
+  /// which file failed verification.
+  pub fn restore(&self, staging_dir: &Path, target_dir: &Path, manifest: &SnapshotManifest) -> Result<(), BackupError> {
+    std::fs::create_dir_all(target_dir)?;
+
+    // Restore flowy-database.db
+    let src_sqlite = staging_dir.join("flowy-database.db");
+    let dst_sqlite = target_dir.join("flowy-database.db");
+    std::fs::copy(&src_sqlite, &dst_sqlite)?;
+
+    // Verify SQLite checksum
+    let sqlite_checksum = compute_sha256_file(&dst_sqlite)?;
+    let expected_sqlite_checksum = manifest
+      .checksums
+      .get("flowy-database.db")
+      .ok_or_else(|| BackupError::Snapshot("Missing checksum for flowy-database.db in manifest".to_string()))?;
+    if sqlite_checksum != *expected_sqlite_checksum {
+      return Err(BackupError::Snapshot(
+        format!("flowy-database.db checksum mismatch: expected {}, got {}", expected_sqlite_checksum, sqlite_checksum)
+      ));
+    }
+
+    // Restore collab_db directory using the same copy logic as snapshot
+    let src_collab_db = staging_dir.join("collab_db");
+    let dst_collab_db = target_dir.join("collab_db");
+    snapshot_closed_collab_db(&src_collab_db, &dst_collab_db)?;
+
+    // Verify collab_db checksum
+    let collab_db_checksum = compute_sha256_dir(&dst_collab_db)?;
+    let expected_collab_db_checksum = manifest
+      .checksums
+      .get("collab_db")
+      .ok_or_else(|| BackupError::Snapshot("Missing checksum for collab_db in manifest".to_string()))?;
+    if collab_db_checksum != *expected_collab_db_checksum {
+      return Err(BackupError::Snapshot(
+        format!("collab_db checksum mismatch: expected {}, got {}", expected_collab_db_checksum, collab_db_checksum)
+      ));
+    }
+
+    Ok(())
+  }
 }
 
 /// Snapshots a SQLite database by running `VACUUM INTO`.
@@ -128,7 +188,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), BackupError> {
 }
 
 /// Computes the SHA256 checksum of a file.
-fn compute_sha256_file(path: &Path) -> Result<String, BackupError> {
+pub fn compute_sha256_file(path: &Path) -> Result<String, BackupError> {
   let contents = std::fs::read(path)?;
   let mut hasher = Sha256::new();
   hasher.update(&contents);
@@ -138,7 +198,7 @@ fn compute_sha256_file(path: &Path) -> Result<String, BackupError> {
 
 /// Computes the SHA256 checksum of a directory by hashing all files in sorted order.
 /// This ensures consistent checksums across snapshots of the same data.
-fn compute_sha256_dir(path: &Path) -> Result<String, BackupError> {
+pub fn compute_sha256_dir(path: &Path) -> Result<String, BackupError> {
   let mut hasher = Sha256::new();
   let mut entries: Vec<_> = std::fs::read_dir(path)?
     .collect::<Result<Vec<_>, _>>()?;
