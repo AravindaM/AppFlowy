@@ -155,4 +155,16 @@ fn restore_fails_on_checksum_mismatch() {
     },
     _ => panic!("Expected BackupError::Snapshot with checksum error"),
   }
+
+  // Verify verify-before-copy: target_dir must remain empty/untouched on checksum mismatch
+  let target_sqlite = target_dir.join("flowy-database.db");
+  let target_collab_db = target_dir.join("collab_db");
+  assert!(
+    !target_sqlite.exists(),
+    "On checksum mismatch, flowy-database.db should NOT be copied to target_dir (verify-before-copy prevents corruption)"
+  );
+  assert!(
+    !target_collab_db.exists(),
+    "On checksum mismatch, collab_db should NOT be copied to target_dir (verify-before-copy prevents corruption)"
+  );
 }

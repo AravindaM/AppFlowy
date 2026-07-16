@@ -69,12 +69,13 @@ impl SnapshotService {
   }
 
   /// Restores a snapshot from a staging directory into a target user directory,
-  /// verifying checksums for each restored file against the manifest.
+  /// verifying checksums BEFORE copying to prevent corruption on mismatch.
   ///
-  /// This function copies `flowy-database.db` and `collab_db/` from the staging
-  /// directory into the target directory, then re-verifies each file's sha256
-  /// checksum against the provided manifest. If any checksum mismatch is detected,
-  /// the restoration fails with an error and the target state is undefined.
+  /// This function first verifies the sha256 checksums of `flowy-database.db` and
+  /// `collab_db/` in the staging directory against the provided manifest. Only if
+  /// all checksums match does it proceed to copy the files into the target directory.
+  /// If any checksum mismatch is detected, the restoration fails with an error and
+  /// no files are written to the target directory (verify-before-copy semantics).
   ///
   /// **Staging semantics:** This function only copies files; the actual atomic
   /// swap into the live app directories is a launch-time concern (Plan 2).
@@ -87,17 +88,11 @@ impl SnapshotService {
   /// # Returns
   /// `Ok(())` if restoration succeeds and all checksums match, or an error otherwise.
   /// On checksum mismatch, returns `BackupError::Snapshot` with a message identifying
-  /// which file failed verification.
+  /// which file failed verification, and target_dir remains untouched.
   pub fn restore(&self, staging_dir: &Path, target_dir: &Path, manifest: &SnapshotManifest) -> Result<(), BackupError> {
-    std::fs::create_dir_all(target_dir)?;
-
-    // Restore flowy-database.db
+    // Verify SQLite checksum BEFORE copying
     let src_sqlite = staging_dir.join("flowy-database.db");
-    let dst_sqlite = target_dir.join("flowy-database.db");
-    std::fs::copy(&src_sqlite, &dst_sqlite)?;
-
-    // Verify SQLite checksum
-    let sqlite_checksum = compute_sha256_file(&dst_sqlite)?;
+    let sqlite_checksum = compute_sha256_file(&src_sqlite)?;
     let expected_sqlite_checksum = manifest
       .checksums
       .get("flowy-database.db")
@@ -108,13 +103,9 @@ impl SnapshotService {
       ));
     }
 
-    // Restore collab_db directory using the same copy logic as snapshot
+    // Verify collab_db checksum BEFORE copying
     let src_collab_db = staging_dir.join("collab_db");
-    let dst_collab_db = target_dir.join("collab_db");
-    snapshot_closed_collab_db(&src_collab_db, &dst_collab_db)?;
-
-    // Verify collab_db checksum
-    let collab_db_checksum = compute_sha256_dir(&dst_collab_db)?;
+    let collab_db_checksum = compute_sha256_dir(&src_collab_db)?;
     let expected_collab_db_checksum = manifest
       .checksums
       .get("collab_db")
@@ -124,6 +115,17 @@ impl SnapshotService {
         format!("collab_db checksum mismatch: expected {}, got {}", expected_collab_db_checksum, collab_db_checksum)
       ));
     }
+
+    // Both checksums verified; now copy to target
+    std::fs::create_dir_all(target_dir)?;
+
+    // Copy flowy-database.db
+    let dst_sqlite = target_dir.join("flowy-database.db");
+    std::fs::copy(&src_sqlite, &dst_sqlite)?;
+
+    // Copy collab_db directory
+    let dst_collab_db = target_dir.join("collab_db");
+    snapshot_closed_collab_db(&src_collab_db, &dst_collab_db)?;
 
     Ok(())
   }
