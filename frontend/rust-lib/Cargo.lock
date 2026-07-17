@@ -2276,6 +2276,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "flowy-backup"
+version = "0.1.0"
+dependencies = [
+ "collab-integrate",
+ "collab-plugins",
+ "rusqlite",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.64",
+ "tracing",
+]
+
+[[package]]
 name = "flowy-codegen"
 version = "0.1.0"
 dependencies = [
@@ -2840,6 +2853,7 @@ dependencies = [
  "serde_json",
  "strum 0.25.0",
  "strum_macros 0.25.2",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",
