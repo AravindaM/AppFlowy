@@ -13,15 +13,16 @@ use flowy_server::af_cloud::define::LoggedUser;
 use flowy_sqlite::kv::KVStorePreferences;
 use flowy_storage::manager::StorageManager;
 use flowy_user::services::authenticate_user::AuthenticateUser;
-use flowy_user::services::entities::UserConfig;
+use flowy_user::services::entities::{UserConfig, UserPaths};
 use flowy_user::user_manager::UserManager;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use sysinfo::System;
 use tokio::sync::RwLock;
 use tracing::{debug, error, event, info, instrument};
 use uuid::Uuid;
+use flowy_backup::SnapshotManifest;
 
 use lib_dispatch::prelude::*;
 use lib_dispatch::runtime::AFPluginRuntime;
@@ -45,6 +46,7 @@ use lib_infra::async_trait::async_trait;
 pub(crate) mod app_life_cycle;
 pub mod config;
 mod deps_resolve;
+pub mod backup_coordinator;
 mod folder_view_observer;
 mod full_indexed_data_provider;
 mod indexed_data_consumer;
@@ -118,6 +120,113 @@ impl AppFlowyCore {
 
   pub fn close_db(&self) {
     self.user_manager.close_db();
+  }
+
+  /// Initialize backup coordinator - should be called after AppFlowyCore is wrapped in Arc
+  pub async fn initialize_backup(&self, core: Arc<Self>) {
+    let core_weak = Arc::downgrade(&core);
+    backup_coordinator::set_app_flowy_core(core_weak).await;
+  }
+
+  #[instrument(skip_all)]
+  pub async fn run_workspace_backup(
+    &self,
+    staging_dir: &Path,
+  ) -> FlowyResult<SnapshotManifest> {
+    use flowy_user_pub::sql::select_user_workspace_type;
+
+    // Get current session to access user_id and workspace_id
+    let session = self.user_manager.get_session()?;
+    let user_id = session.user_id;
+    let workspace_id = Uuid::parse_str(&session.workspace_id)?;
+
+    // Query workspace type from database
+    let mut conn = self.user_manager.db_connection(user_id)?;
+    let workspace_type = select_user_workspace_type(&session.workspace_id, &mut conn)?;
+
+    // Get user paths for snapshot location
+    let data_root = self.config.storage_path.clone();
+    let user_paths = UserPaths::new(data_root.clone());
+    let user_dir = PathBuf::from(user_paths.user_data_dir(user_id));
+
+    // Capture snapshot result but always reopen/rebuild even on error (critical safety)
+    let snapshot_result = async {
+      // Step 2: Clear workspace awareness
+      self.user_manager.clear_workspace_awareness(&workspace_id);
+      debug!("Cleared workspace awareness");
+
+      // Step 3: Close collab_db - this drops the sole Arc in UserDB::collab_db_map
+      self.user_manager.close_collab_db(user_id)?;
+      debug!("Closed collab_db");
+
+      // Step 4: Take snapshot while collab_db is closed
+      let snapshot_service = flowy_backup::SnapshotService::new(&data_root);
+      let manifest = snapshot_service.snapshot(&user_dir, staging_dir)?;
+      debug!("Snapshot completed");
+
+      Ok::<SnapshotManifest, FlowyError>(manifest)
+    }
+    .await;
+
+    // Step 5: Reopen and rebuild - MUST always run even if snapshot failed
+    debug!("Reopening and rebuilding managers after backup");
+    let reopen_result = async {
+      // Use default data source (LocalDisk) for reopening
+      // This matches the logic in on_workspace_opened when data exists on disk
+      use flowy_folder::manager::FolderInitDataSource;
+      let data_source = FolderInitDataSource::LocalDisk {
+        create_if_not_exist: false,
+      };
+
+      // Reinitialize all managers in the same sequence as on_workspace_opened
+      self
+        .folder_manager
+        .initialize_after_open_workspace(user_id, data_source)
+        .await?;
+      debug!("Reinitialized folder manager");
+
+      self
+        .database_manager
+        .initialize_after_open_workspace(user_id, workspace_type.is_local())
+        .await?;
+      debug!("Reinitialized database manager");
+
+      self
+        .document_manager
+        .initialize_after_open_workspace(user_id)
+        .await?;
+      debug!("Reinitialized document manager");
+
+      self
+        .storage_manager
+        .initialize_after_open_workspace(&workspace_id)
+        .await;
+      debug!("Reinitialized storage manager");
+
+      // Re-run user awareness initialization using the public wrapper
+      self
+        .user_manager
+        .reinit_user_awareness(
+          user_id,
+          &session.user_uuid,
+          &workspace_id,
+          &workspace_type,
+        )
+        .await?;
+      debug!("Reinitialized user awareness");
+
+      Ok::<(), FlowyError>(())
+    }
+    .await;
+
+    // If reopen failed, log error but still return the original snapshot result
+    if let Err(err) = reopen_result {
+      error!("Failed to reopen managers after backup: {:?}", err);
+      // Do NOT return the reopen error - the snapshot result is what matters
+    }
+
+    // Return the snapshot result (success or failure)
+    snapshot_result
   }
 
   #[instrument(skip(config, runtime))]

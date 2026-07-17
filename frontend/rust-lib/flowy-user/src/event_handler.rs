@@ -862,3 +862,16 @@ pub async fn notify_did_switch_plan_handler(
   manager.notify_did_switch_plan(success).await?;
   Ok(())
 }
+
+#[tracing::instrument(level = "info", skip_all, err)]
+pub async fn backup_workspace_handler(
+  params: AFPluginData<BackupWorkspacePB>,
+  _manager: AFPluginState<Weak<UserManager>>,
+) -> Result<(), FlowyError> {
+  let params = params.into_inner();
+  let staging_dir = std::path::Path::new(&params.staging_dir);
+
+  // Call the backup coordinator which accesses AppFlowyCore
+  flowy_core::backup_coordinator::run_workspace_backup(staging_dir).await?;
+  Ok(())
+}

@@ -81,6 +81,7 @@ pub fn init(user_manager: Weak<UserManager>) -> AFPlugin {
     .event(UserEvent::GetWorkspaceSetting, get_workspace_setting_handler)
     .event(UserEvent::NotifyDidSwitchPlan, notify_did_switch_plan_handler)
     .event(UserEvent::PasscodeSignIn, sign_in_with_passcode_handler)
+    .event(UserEvent::BackupWorkspace, backup_workspace_handler)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Display, Hash, ProtoBuf_Enum, Flowy_Event)]
@@ -274,6 +275,10 @@ pub enum UserEvent {
 
   #[event(input = "PasscodeSignInPB", output = "GotrueTokenResponsePB")]
   PasscodeSignIn = 65,
+
+  /// Backup the current workspace by snapshotting the live collab_db
+  #[event(input = "BackupWorkspacePB")]
+  BackupWorkspace = 66,
 }
 
 #[async_trait]
