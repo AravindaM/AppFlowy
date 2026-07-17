@@ -87,6 +87,18 @@ impl UserDB {
     Ok(())
   }
 
+  /// Close only the collab database connection for the user without affecting other databases.
+  /// This is used for backup/quiesce operations that need to reset the collab DB connection
+  /// while keeping other database connections active.
+  pub fn close_collab_db(&self, user_id: i64) -> Result<(), FlowyError> {
+    if let Some((_, db)) = self.collab_db_map.remove(&user_id) {
+      tracing::trace!("close collab db for user {}", user_id);
+      let _ = db.flush();
+      drop(db);
+    }
+    Ok(())
+  }
+
   pub(crate) fn get_connection(&self, user_id: i64) -> Result<DBConnection, FlowyError> {
     let conn = self.get_pool(user_id)?.get()?;
     Ok(conn)
@@ -346,5 +358,51 @@ pub(crate) fn validate_collab_db(
         PersistenceError::RocksdbCorruption(_) | PersistenceError::RocksdbRepairFail(_)
       )
     },
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use tempfile::tempdir;
+
+  #[test]
+  fn test_close_collab_db() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let paths = UserPaths::new(temp_dir.path().to_string_lossy().to_string());
+    let user_db = UserDB::new(paths);
+    let uid = 1i64;
+
+    // Get the collab db to populate the map
+    let result1 = user_db.get_collab_db(uid);
+    assert!(result1.is_ok(), "First get_collab_db should succeed");
+    let weak_db1 = result1.unwrap();
+
+    // Verify the weak pointer is valid (can be upgraded)
+    assert!(
+      weak_db1.upgrade().is_some(),
+      "Weak pointer should be valid after get_collab_db"
+    );
+
+    // Close the collab db
+    let close_result = user_db.close_collab_db(uid);
+    assert!(close_result.is_ok(), "close_collab_db should succeed");
+
+    // Verify the old weak pointer is now invalid (dead)
+    assert!(
+      weak_db1.upgrade().is_none(),
+      "Weak pointer should be invalid after close_collab_db"
+    );
+
+    // Open the collab db again to get a fresh handle
+    let result2 = user_db.get_collab_db(uid);
+    assert!(result2.is_ok(), "Second get_collab_db should succeed");
+    let weak_db2 = result2.unwrap();
+
+    // Verify the new weak pointer is valid
+    assert!(
+      weak_db2.upgrade().is_some(),
+      "New weak pointer should be valid"
+    );
   }
 }

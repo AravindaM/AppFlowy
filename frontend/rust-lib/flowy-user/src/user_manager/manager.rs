@@ -122,6 +122,10 @@ impl UserManager {
     }
   }
 
+  pub fn clear_workspace_awareness(&self, workspace_id: &Uuid) {
+    self.user_awareness_by_workspace.remove(workspace_id);
+  }
+
   pub fn get_store_preferences(&self) -> Weak<KVStorePreferences> {
     Arc::downgrade(&self.store_preferences)
   }
