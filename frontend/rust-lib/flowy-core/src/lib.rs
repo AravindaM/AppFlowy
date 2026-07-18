@@ -20,7 +20,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 use sysinfo::System;
 use tokio::sync::RwLock;
-use tracing::{debug, error, event, info, instrument};
+use tracing::{debug, error, event, info, instrument, warn};
 use uuid::Uuid;
 use flowy_backup::SnapshotManifest;
 
@@ -58,6 +58,19 @@ pub(crate) mod server_layer;
 /// This name will be used as to identify the current [AppFlowyCore] instance.
 /// Don't change this.
 pub const DEFAULT_NAME: &str = "appflowy";
+
+/// Result of a workspace backup operation, separating snapshot success from reopen success.
+/// The backup must always attempt to reopen the workspace even if snapshot fails,
+/// so we need to communicate both outcomes to the caller.
+#[derive(Clone, Debug)]
+pub struct WorkspaceBackupResult {
+  pub manifest: SnapshotManifest,
+  pub reopen_ok: bool,
+  pub reopen_error: Option<String>,
+}
+
+// Re-export for FFI and public API
+pub use self::WorkspaceBackupResult;
 
 #[derive(Clone)]
 pub struct AppFlowyCore {
@@ -132,7 +145,7 @@ impl AppFlowyCore {
   pub async fn run_workspace_backup(
     &self,
     staging_dir: &Path,
-  ) -> FlowyResult<SnapshotManifest> {
+  ) -> FlowyResult<WorkspaceBackupResult> {
     use flowy_user_pub::sql::select_user_workspace_type;
 
     // Get current session to access user_id and workspace_id
@@ -148,6 +161,19 @@ impl AppFlowyCore {
     let data_root = self.config.storage_path.clone();
     let user_paths = UserPaths::new(data_root.clone());
     let user_dir = PathBuf::from(user_paths.user_data_dir(user_id));
+
+    // FIX 1: Explicitly close all live collab objects for managers BEFORE closing collab_db
+    // so their Weak references die and per-object flush plugins stop.
+    debug!("Closing collab objects for backup quiesce");
+    if let Err(err) = self.folder_manager.close_for_backup().await {
+      error!("Failed to close folder manager for backup: {:?}", err);
+    }
+    if let Err(err) = self.database_manager.close_for_backup().await {
+      error!("Failed to close database manager for backup: {:?}", err);
+    }
+    if let Err(err) = self.document_manager.close_for_backup().await {
+      error!("Failed to close document manager for backup: {:?}", err);
+    }
 
     // Capture snapshot result but always reopen/rebuild even on error (critical safety)
     let snapshot_result = async {
@@ -170,6 +196,9 @@ impl AppFlowyCore {
 
     // Step 5: Reopen and rebuild - MUST always run even if snapshot failed
     debug!("Reopening and rebuilding managers after backup");
+    let mut reopen_ok = true;
+    let mut reopen_error: Option<String> = None;
+
     let reopen_result = async {
       // Use default data source (LocalDisk) for reopening
       // This matches the logic in on_workspace_opened when data exists on disk
@@ -197,10 +226,14 @@ impl AppFlowyCore {
         .await?;
       debug!("Reinitialized document manager");
 
-      self
+      // FIX 4: Log storage manager init failures explicitly
+      if let Err(err) = self
         .storage_manager
         .initialize_after_open_workspace(&workspace_id)
-        .await;
+        .await
+      {
+        warn!("Storage manager initialization after backup failed: {:?}", err);
+      }
       debug!("Reinitialized storage manager");
 
       // Re-run user awareness initialization using the public wrapper
@@ -219,14 +252,28 @@ impl AppFlowyCore {
     }
     .await;
 
-    // If reopen failed, log error but still return the original snapshot result
+    // FIX 3: Surface reopen failures explicitly
     if let Err(err) = reopen_result {
-      error!("Failed to reopen managers after backup: {:?}", err);
-      // Do NOT return the reopen error - the snapshot result is what matters
+      reopen_ok = false;
+      reopen_error = Some(err.to_string());
+      warn!("Failed to reopen managers after backup: app may be degraded: {:?}", err);
     }
 
-    // Return the snapshot result (success or failure)
-    snapshot_result
+    // Return partial success result - snapshot success is separate from reopen success
+    match snapshot_result {
+      Ok(manifest) => {
+        Ok(WorkspaceBackupResult {
+          manifest,
+          reopen_ok,
+          reopen_error,
+        })
+      },
+      Err(err) => {
+        // Even if snapshot failed, return the error with reopen status
+        // This helps diagnose whether the app is still usable
+        Err(err)
+      }
+    }
   }
 
   #[instrument(skip(config, runtime))]

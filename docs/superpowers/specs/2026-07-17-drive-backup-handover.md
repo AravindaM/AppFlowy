@@ -55,6 +55,18 @@ Unit tests cannot prove close/copy/reopen under live plugin flushes. After fixin
 4. **Adversarial:** trigger backup while actively typing. Assert: no crash, no lost edits beyond the last flush, snapshot opens clean. If corruption/crash appears, the Weak-only close is insufficient under load → add explicit per-manager collab-object close + plugin-stop before the copy (re-evaluate the upstream-edit budget).
 5. Smoke-test the **WAL fix** separately: open/edit/restart the app, confirm `-wal`/`-shm` handling and existing flows are unaffected.
 
+## Principal Rust architect review (2026-07-18) — full changeset
+
+Verdict: Drop-and-Copy + workspace-reinit is the right approach; Plan 1's core holds up; **Plan 2 has three real defects** beyond the compile-unverified status. Corrected a prior error: the committed orchestration (`flowy-core/src/lib.rs:155–202`) does **clear_awareness → close_collab_db → snapshot → reinit** and does NOT close collab objects/stop plugins first.
+
+- **CRITICAL 1 — quiesce doesn't actually quiesce.** Relies solely on dropping the one `Arc` in `UserDB::collab_db_map`; never closes live collab objects or stops flush plugins first. A plugin flush thread can upgrade its `Weak` during the copy → torn snapshot → silent corruption on restore. Fix: explicitly close collab objects (folder/document/database) + stop plugins BEFORE `close_collab_db`.
+- **CRITICAL 2 — backup event dead on arrival.** `backup_coordinator` global lazy-static never initialized (`initialize_backup()` has no caller; dart-ffi holds `Option<AppFlowyCore>` not `Arc`). Fix: delete the bridge, register `BackupWorkspace` in `flowy-core`.
+- **CRITICAL 3 — reopen failures report success** (`lib.rs:222–230`), leaving the app silently degraded. Fix: partial-success return type.
+- **HIGH:** storage-manager reopen error ignored (`lib.rs:201–204`); `snapshot_closed_collab_db` precondition is doc-only (consider a closed-handle witness token).
+- **MEDIUM:** document dir-checksum symlink/rename behavior; verify diesel + rusqlite share the bundled `libsqlite3-sys`.
+
+Status of fixes: see the FIX PASS section appended after implementation.
+
 ## Commit map (branch `feat/google-drive-backup`)
 
 - WAL fix, `flowy-backup` crate + tests (Plan 1): `a3e91fe`, `3406ced`, `3de588e`, `1aec318`, `8fe8a2d`, `9561052`.

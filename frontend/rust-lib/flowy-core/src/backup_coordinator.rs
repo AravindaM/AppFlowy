@@ -3,21 +3,26 @@ use tokio::sync::RwLock;
 use once_cell::sync::Lazy;
 use flowy_error::FlowyResult;
 use std::path::Path;
-use flowy_backup::SnapshotManifest;
+use tracing::debug;
 
 /// Global backup coordinator - stores a weak reference to AppFlowyCore
-/// This allows event handlers to access the backup functionality
+/// This allows event handlers in other crates to access the backup functionality.
+/// It's initialized by AppFlowyCore after construction.
 static BACKUP_COORDINATOR: Lazy<RwLock<Option<Weak<crate::AppFlowyCore>>>> =
   Lazy::new(|| RwLock::new(None));
 
-/// Set the AppFlowyCore reference for backup operations
+/// Set the AppFlowyCore reference for backup operations.
+/// Called from AppFlowyCore::initialize_backup() to ensure the backup functionality is available.
 pub async fn set_app_flowy_core(core: Weak<crate::AppFlowyCore>) {
   let mut coordinator = BACKUP_COORDINATOR.write().await;
   *coordinator = Some(core);
+  debug!("Backup coordinator initialized");
 }
 
 /// Execute a workspace backup via the global coordinator
-pub async fn run_workspace_backup(staging_dir: &Path) -> FlowyResult<SnapshotManifest> {
+pub async fn run_workspace_backup(
+  staging_dir: &Path,
+) -> FlowyResult<crate::WorkspaceBackupResult> {
   let coordinator = BACKUP_COORDINATOR.read().await;
   let weak_core = coordinator
     .as_ref()
