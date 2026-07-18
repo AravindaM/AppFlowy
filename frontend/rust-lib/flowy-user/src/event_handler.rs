@@ -864,23 +864,3 @@ pub async fn notify_did_switch_plan_handler(
 }
 
 #[tracing::instrument(level = "info", skip_all, err)]
-pub async fn backup_workspace_handler(
-  params: AFPluginData<BackupWorkspacePB>,
-  _manager: AFPluginState<Weak<UserManager>>,
-) -> Result<(), FlowyError> {
-  let params = params.into_inner();
-  let staging_dir = std::path::Path::new(&params.staging_dir);
-
-  // Call the backup coordinator which accesses AppFlowyCore
-  let backup_result = flowy_core::backup_coordinator::run_workspace_backup(staging_dir).await?;
-
-  // Log reopen status if there were issues
-  if !backup_result.reopen_ok {
-    tracing::warn!(
-      "Backup completed but workspace reopen failed: {}",
-      backup_result.reopen_error.as_deref().unwrap_or("unknown error")
-    );
-  }
-
-  Ok(())
-}

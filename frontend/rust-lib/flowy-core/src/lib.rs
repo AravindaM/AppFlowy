@@ -46,7 +46,7 @@ use lib_infra::async_trait::async_trait;
 pub(crate) mod app_life_cycle;
 pub mod config;
 mod deps_resolve;
-pub mod backup_coordinator;
+pub mod backup_event;
 mod folder_view_observer;
 mod full_indexed_data_provider;
 mod indexed_data_consumer;
@@ -133,12 +133,6 @@ impl AppFlowyCore {
 
   pub fn close_db(&self) {
     self.user_manager.close_db();
-  }
-
-  /// Initialize backup coordinator - should be called after AppFlowyCore is wrapped in Arc
-  pub async fn initialize_backup(&self, core: Arc<Self>) {
-    let core_weak = Arc::downgrade(&core);
-    backup_coordinator::set_app_flowy_core(core_weak).await;
   }
 
   #[instrument(skip_all)]
@@ -466,6 +460,7 @@ impl AppFlowyCore {
         Arc::downgrade(&search_manager),
         Arc::downgrade(&ai_manager),
         Arc::downgrade(&storage_manager),
+        Arc::new(config.clone()),
       ),
     ));
 
