@@ -1,0 +1,80 @@
+name: Build macOS App (fork)
+
+# Builds an UNSIGNED, independently-runnable macOS AppFlowy .app for this fork
+# and uploads it as a downloadable artifact. No code signing / notarization
+# (this fork has no Apple developer secrets) — on first launch, open the app via
+# right-click > Open to get past Gatekeeper.
+#
+# Triggered manually (workflow_dispatch) or by pushing a `fork-v*` tag. Not on
+# every push — a full universal macOS build is ~30-45 min of (pricier) macOS
+# runner time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Build label (used in the artifact name and product path; keep it filename-safe)"
+        required: false
+        default: "fork-dev"
+  push:
+    tags:
+      - "fork-v*"
+
+env:
+  FLUTTER_VERSION: "3.27.4"
+  RUST_TOOLCHAIN: "1.85.0"
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    env:
+      APP_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          override: true
+          profile: minimal
+          target: x86_64-apple-darwin
+
+      - name: Add rust targets for universal build
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/rust-lib
+
+      - name: Install cargo-make
+        run: cargo install --locked cargo-make
+
+      - name: Install AppFlowy build deps (protoc-gen-dart etc.)
+        working-directory: frontend
+        run: cargo make appflowy-flutter-deps-tools
+
+      - name: Enable macOS desktop
+        run: flutter config --enable-macos-desktop
+
+      - name: Build universal macOS app (unsigned)
+        working-directory: frontend
+        run: sh scripts/flutter_release_build/build_universal_package_for_macos.sh "${{ env.APP_VERSION }}"
+
+      - name: Zip the .app
+        working-directory: frontend/appflowy_flutter/product/${{ env.APP_VERSION }}/macos/Release
+        run: zip --symlinks -qr "AppFlowy-macos-${{ env.APP_VERSION }}.zip" AppFlowy.app
+
+      - name: Upload the app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppFlowy-macos-${{ env.APP_VERSION }}
+          path: frontend/appflowy_flutter/product/${{ env.APP_VERSION }}/macos/Release/AppFlowy-macos-${{ env.APP_VERSION }}.zip
+          if-no-files-found: error
