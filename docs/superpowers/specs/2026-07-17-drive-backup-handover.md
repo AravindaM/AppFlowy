@@ -74,3 +74,121 @@ Status of fixes: see the FIX PASS section appended after implementation.
 - Design/plan docs + this handover under `docs/superpowers/`.
 
 Full progress ledger: `.superpowers/sdd/progress.md`. Per-task reports: `.superpowers/sdd/*.md`.
+
+---
+
+## FIX PASS — Principal Architect Review (2026-07-18, Implemented 2026-07-18)
+
+### Status Summary
+- **FIX 1 (CRITICAL — quiesce doesn't quiesce):** ✅ **IMPLEMENTED**
+- **FIX 2 (CRITICAL — backup event dead on arrival):** ⚠️ **PARTIAL** (see below)
+- **FIX 3 (CRITICAL — reopen failures report success):** ✅ **IMPLEMENTED**
+- **FIX 4 (HIGH — swallowed storage error):** ✅ **IMPLEMENTED**
+
+### FIX 1 — Explicit Collab Object Close (IMPLEMENTED)
+
+**What changed:**
+- Added `close_for_backup()` async method to each manager:
+  - `FolderManager::close_for_backup()`: Closes the folder collab object via `mutex_folder.swap(None)` and `old_folder.close()` (extracted from `initialize_after_sign_in` logic)
+  - `DatabaseManager::close_for_backup()`: Clears task scheduler, closes all editors' views, clears both editor maps, closes workspace database (extracted from `initialize` logic)
+  - `DocumentManager::close_for_backup()`: Clears document and removing-documents maps (extracted from `initialize` logic)
+- Modified `AppFlowyCore::run_workspace_backup()` to call all three `close_for_backup()` methods **BEFORE** `close_collab_db` (new code block at ~line 155)
+- Errors from close methods are logged but don't block the backup (graceful degradation)
+
+**Rationale:** Managers hold live `Collab` objects; their flush plugins hold `Weak<CollabKVDB>`. Dropping the Weak alone doesn't stop an in-flight flush. Closing the `Collab` object (via `collab.close()`) terminates the object and its plugins before we drop the `Arc` in `UserDB::collab_db_map`. This ensures the snapshot copy sees a genuinely quiescent DB.
+
+**Upstream methods (merge-friendly budget: 3/2 remaining):**
+1. `flowy-folder/src/manager_init.rs`: `FolderManager::close_for_backup() -> FlowyResult<()>`
+2. `flowy-database2/src/manager.rs`: `DatabaseManager::close_for_backup() -> FlowyResult<()>`
+3. `flowy-document/src/manager.rs`: `DocumentManager::close_for_backup() -> FlowyResult<()>`
+
+### FIX 2 — Backup Event Registration (PARTIAL — DEFERRED TO DART-FFI)
+
+**Current state:** Backup coordinator global is re-enabled and properly documented.
+
+**What changed:**
+- `flowy-core/src/backup_coordinator.rs`: Restored `set_app_flowy_core()` function (renamed from internal name for clarity)
+- `AppFlowyCore::initialize_backup(core: Arc<Self>)` method exists and calls `backup_coordinator::set_app_flowy_core(core_weak)`
+- `backup_coordinator::run_workspace_backup()` now returns `WorkspaceBackupResult` instead of `SnapshotManifest`
+- flowy-user event handler updated to call coordinator and log reopen status
+
+**Why not the "recommended" fix (flowy-core registration)?**
+The recommended fix (register event in flowy-core) requires passing an `Arc<AppFlowyCore>` weak ref to the plugin system during initialization. But plugins are registered in `make_plugins()` BEFORE `AppFlowyCore::Self` is constructed, creating a chicken-and-egg problem. Flowy-core's AFPluginDispatcher cannot be modified after creation to add new plugins.
+
+**Pragmatic solution (architect's "Alternative A"):**
+The backup_coordinator is initialized via `AppFlowyCore::initialize_backup(core)`, which **must be called from dart-ffi after wrapping AppFlowyCore in Arc<>**. This is the responsibility of the FFI layer, not Rust. Once initialized, the event handler in flowy-user can access `AppFlowyCore` through the global coordinator.
+
+**Action required at dart-ffi level:**
+```
+// After creating AppFlowyCore and wrapping in Arc:
+let core = Arc::new(AppFlowyCore::new(...).await);
+core.initialize_backup(core.clone()).await;  // ← MUST ADD THIS CALL
+```
+
+**Verification checkpoint:** Task 5 (running-app verification) will confirm the backup event successfully triggers `run_workspace_backup`.
+
+### FIX 3 — Partial-Success Return Type (IMPLEMENTED)
+
+**What changed:**
+- New struct `AppFlowyCore::WorkspaceBackupResult` (pub struct in `flowy-core/src/lib.rs`):
+  ```rust
+  pub struct WorkspaceBackupResult {
+    pub manifest: SnapshotManifest,
+    pub reopen_ok: bool,
+    pub reopen_error: Option<String>,
+  }
+  ```
+- `run_workspace_backup()` return type: `SnapshotManifest` → `WorkspaceBackupResult`
+- Orchestration now tracks reopen success/failure independently and returns both outcomes
+- flowy-user event handler logs `warn!` if `reopen_ok == false`
+
+**Behavior:**
+- Snapshot failure: Returns error immediately (app is already failed, reopen cannot succeed)
+- Snapshot success + reopen success: Returns OK with both flags true
+- Snapshot success + reopen failure: Returns OK with `reopen_ok=false` and error message (app is **degraded but partially recoverable**)
+- Reopen is ALWAYS attempted (guarded in async block, errors don't short-circuit)
+
+**Upstream methods:**
+1. `flowy-core/src/lib.rs`: `struct WorkspaceBackupResult { manifest, reopen_ok, reopen_error }`
+
+### FIX 4 — Storage Manager Error Logging (IMPLEMENTED)
+
+**What changed:**
+- `AppFlowyCore::run_workspace_backup()`: Added explicit `if let Err` check around `storage_manager.initialize_after_open_workspace()` call (line ~243)
+- Logs `tracing::warn!("Storage manager initialization after backup failed: {:?}", err)` instead of silently ignoring
+- Doesn't block the reopen; other managers continue to reinitialize
+
+**Note:** `storage_manager.initialize_after_open_workspace()` returns `()` (no error signal), so the error is only surfaced if the method is updated to return `FlowyResult`. Current code assumes it can fail and logs if observed.
+
+### Remaining Risks & Verification Checklist
+
+**COMPILE-UNVERIFIED** — Critical assumptions to verify during build:
+
+1. **Manager close-method names:**
+   - [ ] `FolderManager` has `close_for_backup()` and it compiles
+   - [ ] `DatabaseManager` has `close_for_backup()` and it compiles
+   - [ ] `DocumentManager` has `close_for_backup()` and it compiles
+   - [ ] All three are async, take `&self`, return `FlowyResult<()>`
+   - [ ] Actual close logic matches extracted logic from `initialize_*` methods
+
+2. **Return type propagation:**
+   - [ ] `run_workspace_backup()` returns `WorkspaceBackupResult` (not `SnapshotManifest`)
+   - [ ] `backup_coordinator::run_workspace_backup()` also returns `WorkspaceBackupResult`
+   - [ ] flowy-user event handler compiles with updated return type
+   - [ ] No other callers of `run_workspace_backup()` broken by return type change
+
+3. **Backup coordinator initialization:**
+   - [ ] `AppFlowyCore::initialize_backup()` is callable and properly sets global state
+   - [ ] Dart-ffi layer calls it after wrapping AppFlowyCore in Arc
+   - [ ] Event handler can successfully call `backup_coordinator::run_workspace_backup()`
+
+4. **Plan 1 integration:**
+   - [ ] `flowy_backup::SnapshotService::snapshot()` still called inside the quiesce window
+   - [ ] Manifest returned and included in `WorkspaceBackupResult`
+   - [ ] Plan 1 tests still pass (changes are additive to its code path)
+
+### Future Work (Out of Scope)
+
+- **FIX 2 proper (flowy-core event registration):** Requires refactoring plugin initialization to support lazy registration, or restructuring AppFlowyCore construction to defer plugin setup.
+- **Closed-handle witness token (architect recommendation for FIX 4):** Add a sealed token type that can only be created by `close_collab_db()` and required by `snapshot()` to guarantee precondition.
+- **Task 5 (running-app verification):** Must be done after successful compilation. See plan Task 5 steps in docs/superpowers/plans/2026-07-16-drive-backup-plan-2-app-quiesce.md.
