@@ -1,10 +1,10 @@
 use flowy_derive::ProtoBuf;
-use lib_infra::validator_fn::required_not_empty_str;
-use validator::Validate;
 
-#[derive(ProtoBuf, Validate, Default)]
-pub struct BackupWorkspacePB {
-  #[pb(index = 1)]
-  #[validate(custom(function = "required_not_empty_str"))]
-  pub staging_dir: String,
-}
+/// Input for the BackupWorkspace event.
+///
+/// Intentionally carries no filesystem path: the backend derives the snapshot
+/// staging directory itself under the app data root. Accepting a caller-supplied
+/// path here would let a compromised renderer write the full unencrypted
+/// workspace database to an arbitrary location (path traversal / arbitrary write).
+#[derive(ProtoBuf, Default)]
+pub struct BackupWorkspacePB {}

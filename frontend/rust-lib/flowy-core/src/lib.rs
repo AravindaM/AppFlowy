@@ -13,9 +13,9 @@ use flowy_server::af_cloud::define::LoggedUser;
 use flowy_sqlite::kv::KVStorePreferences;
 use flowy_storage::manager::StorageManager;
 use flowy_user::services::authenticate_user::AuthenticateUser;
-use flowy_user::services::entities::{UserConfig, UserPaths};
+use flowy_user::services::entities::UserConfig;
 use flowy_user::user_manager::UserManager;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use sysinfo::System;
@@ -133,141 +133,6 @@ impl AppFlowyCore {
 
   pub fn close_db(&self) {
     self.user_manager.close_db();
-  }
-
-  #[instrument(skip_all)]
-  pub async fn run_workspace_backup(
-    &self,
-    staging_dir: &Path,
-  ) -> FlowyResult<WorkspaceBackupResult> {
-    use flowy_user_pub::sql::select_user_workspace_type;
-
-    // Get current session to access user_id and workspace_id
-    let session = self.user_manager.get_session()?;
-    let user_id = session.user_id;
-    let workspace_id = Uuid::parse_str(&session.workspace_id)?;
-
-    // Query workspace type from database
-    let mut conn = self.user_manager.db_connection(user_id)?;
-    let workspace_type = select_user_workspace_type(&session.workspace_id, &mut conn)?;
-
-    // Get user paths for snapshot location
-    let data_root = self.config.storage_path.clone();
-    let user_paths = UserPaths::new(data_root.clone());
-    let user_dir = PathBuf::from(user_paths.user_data_dir(user_id));
-
-    // FIX 1: Explicitly close all live collab objects for managers BEFORE closing collab_db
-    // so their Weak references die and per-object flush plugins stop.
-    debug!("Closing collab objects for backup quiesce");
-    if let Err(err) = self.folder_manager.close_for_backup().await {
-      error!("Failed to close folder manager for backup: {:?}", err);
-    }
-    if let Err(err) = self.database_manager.close_for_backup().await {
-      error!("Failed to close database manager for backup: {:?}", err);
-    }
-    if let Err(err) = self.document_manager.close_for_backup().await {
-      error!("Failed to close document manager for backup: {:?}", err);
-    }
-
-    // Capture snapshot result but always reopen/rebuild even on error (critical safety)
-    let snapshot_result = async {
-      // Step 2: Clear workspace awareness
-      self.user_manager.clear_workspace_awareness(&workspace_id);
-      debug!("Cleared workspace awareness");
-
-      // Step 3: Close collab_db - this drops the sole Arc in UserDB::collab_db_map
-      self.user_manager.close_collab_db(user_id)?;
-      debug!("Closed collab_db");
-
-      // Step 4: Take snapshot while collab_db is closed
-      let snapshot_service = flowy_backup::SnapshotService::new(&data_root);
-      let manifest = snapshot_service.snapshot(&user_dir, staging_dir)?;
-      debug!("Snapshot completed");
-
-      Ok::<SnapshotManifest, FlowyError>(manifest)
-    }
-    .await;
-
-    // Step 5: Reopen and rebuild - MUST always run even if snapshot failed
-    debug!("Reopening and rebuilding managers after backup");
-    let mut reopen_ok = true;
-    let mut reopen_error: Option<String> = None;
-
-    let reopen_result = async {
-      // Use default data source (LocalDisk) for reopening
-      // This matches the logic in on_workspace_opened when data exists on disk
-      use flowy_folder::manager::FolderInitDataSource;
-      let data_source = FolderInitDataSource::LocalDisk {
-        create_if_not_exist: false,
-      };
-
-      // Reinitialize all managers in the same sequence as on_workspace_opened
-      self
-        .folder_manager
-        .initialize_after_open_workspace(user_id, data_source)
-        .await?;
-      debug!("Reinitialized folder manager");
-
-      self
-        .database_manager
-        .initialize_after_open_workspace(user_id, workspace_type.is_local())
-        .await?;
-      debug!("Reinitialized database manager");
-
-      self
-        .document_manager
-        .initialize_after_open_workspace(user_id)
-        .await?;
-      debug!("Reinitialized document manager");
-
-      // FIX 4: Log storage manager init failures explicitly
-      if let Err(err) = self
-        .storage_manager
-        .initialize_after_open_workspace(&workspace_id)
-        .await
-      {
-        warn!("Storage manager initialization after backup failed: {:?}", err);
-      }
-      debug!("Reinitialized storage manager");
-
-      // Re-run user awareness initialization using the public wrapper
-      self
-        .user_manager
-        .reinit_user_awareness(
-          user_id,
-          &session.user_uuid,
-          &workspace_id,
-          &workspace_type,
-        )
-        .await?;
-      debug!("Reinitialized user awareness");
-
-      Ok::<(), FlowyError>(())
-    }
-    .await;
-
-    // FIX 3: Surface reopen failures explicitly
-    if let Err(err) = reopen_result {
-      reopen_ok = false;
-      reopen_error = Some(err.to_string());
-      warn!("Failed to reopen managers after backup: app may be degraded: {:?}", err);
-    }
-
-    // Return partial success result - snapshot success is separate from reopen success
-    match snapshot_result {
-      Ok(manifest) => {
-        Ok(WorkspaceBackupResult {
-          manifest,
-          reopen_ok,
-          reopen_error,
-        })
-      },
-      Err(err) => {
-        // Even if snapshot failed, return the error with reopen status
-        // This helps diagnose whether the app is still usable
-        Err(err)
-      }
-    }
   }
 
   #[instrument(skip(config, runtime))]

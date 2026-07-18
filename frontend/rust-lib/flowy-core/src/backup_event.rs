@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::{Arc, Weak};
 use flowy_backup::SnapshotManifest;
 use flowy_error::FlowyResult;
@@ -43,7 +42,7 @@ pub enum BackupEvent {
 }
 
 pub async fn backup_workspace_handler(
-  params: AFPluginData<BackupWorkspacePB>,
+  _params: AFPluginData<BackupWorkspacePB>,
   user_manager: AFPluginState<Weak<UserManager>>,
   folder_manager: AFPluginState<Weak<FolderManager>>,
   database_manager: AFPluginState<Weak<DatabaseManager>>,
@@ -51,9 +50,6 @@ pub async fn backup_workspace_handler(
   storage_manager: AFPluginState<Weak<StorageManager>>,
   config: AFPluginState<Arc<AppFlowyCoreConfig>>,
 ) -> Result<(), FlowyError> {
-  let params = params.into_inner();
-  let staging_dir = Path::new(&params.staging_dir);
-
   let backup_result = execute_workspace_backup(
     user_manager.as_ref().clone(),
     folder_manager.as_ref().clone(),
@@ -61,7 +57,6 @@ pub async fn backup_workspace_handler(
     document_manager.as_ref().clone(),
     storage_manager.as_ref().clone(),
     config.as_ref().clone(),
-    staging_dir,
   )
   .await?;
 
@@ -84,7 +79,6 @@ pub async fn execute_workspace_backup(
   document_manager: Weak<DocumentManager>,
   storage_manager: Weak<StorageManager>,
   config: Arc<AppFlowyCoreConfig>,
-  staging_dir: &Path,
 ) -> FlowyResult<WorkspaceBackupResult> {
   use flowy_user_pub::sql::select_user_workspace_type;
 
@@ -127,6 +121,15 @@ pub async fn execute_workspace_backup(
   let user_paths = UserPaths::new(data_root.clone());
   let user_dir = std::path::PathBuf::from(user_paths.user_data_dir(user_id));
 
+  // SECURITY: the snapshot staging directory is derived here, backend-side, under
+  // the app data root — never supplied by the caller/renderer. Accepting a caller
+  // path would allow writing the full unencrypted workspace database to an
+  // arbitrary filesystem location (path traversal / arbitrary write).
+  let staging_dir = std::path::PathBuf::from(&data_root)
+    .join("backups")
+    .join("staging")
+    .join(Uuid::new_v4().to_string());
+
   // FIX 1: Explicitly close all live collab objects for managers BEFORE closing collab_db
   // so their Weak references die and per-object flush plugins stop.
   debug!("Closing collab objects for backup quiesce");
@@ -152,7 +155,7 @@ pub async fn execute_workspace_backup(
 
     // Step 4: Take snapshot while collab_db is closed
     let snapshot_service = flowy_backup::SnapshotService::new(&data_root);
-    let manifest = snapshot_service.snapshot(&user_dir, staging_dir)?;
+    let manifest = snapshot_service.snapshot(&user_dir, &staging_dir)?;
     debug!("Snapshot completed");
 
     Ok::<SnapshotManifest, FlowyError>(manifest)
