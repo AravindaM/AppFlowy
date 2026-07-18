@@ -22,6 +22,7 @@ use sysinfo::System;
 use tokio::sync::RwLock;
 use tracing::{debug, error, event, info, instrument};
 use uuid::Uuid;
+use flowy_backup::SnapshotManifest;
 
 use lib_dispatch::prelude::*;
 use lib_dispatch::runtime::AFPluginRuntime;
@@ -45,6 +46,7 @@ use lib_infra::async_trait::async_trait;
 pub(crate) mod app_life_cycle;
 pub mod config;
 mod deps_resolve;
+pub mod backup_event;
 mod folder_view_observer;
 mod full_indexed_data_provider;
 mod indexed_data_consumer;
@@ -56,6 +58,16 @@ pub(crate) mod server_layer;
 /// This name will be used as to identify the current [AppFlowyCore] instance.
 /// Don't change this.
 pub const DEFAULT_NAME: &str = "appflowy";
+
+/// Result of a workspace backup operation, separating snapshot success from reopen success.
+/// The backup must always attempt to reopen the workspace even if snapshot fails,
+/// so we need to communicate both outcomes to the caller.
+#[derive(Clone, Debug)]
+pub struct WorkspaceBackupResult {
+  pub manifest: SnapshotManifest,
+  pub reopen_ok: bool,
+  pub reopen_error: Option<String>,
+}
 
 #[derive(Clone)]
 pub struct AppFlowyCore {
@@ -310,6 +322,7 @@ impl AppFlowyCore {
         Arc::downgrade(&search_manager),
         Arc::downgrade(&ai_manager),
         Arc::downgrade(&storage_manager),
+        Arc::new(config.clone()),
       ),
     ));
 

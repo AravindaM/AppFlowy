@@ -1,0 +1,222 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use rusqlite::Connection;
+use sha2::{Sha256, Digest};
+
+#[derive(Debug, thiserror::Error)]
+pub enum BackupError {
+  #[error("snapshot io: {0}")]
+  Io(#[from] std::io::Error),
+  #[error("snapshot failed: {0}")]
+  Snapshot(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotManifest {
+  pub checksums: BTreeMap<String, String>,
+}
+
+pub struct SnapshotService {
+  data_root: PathBuf,
+}
+
+impl SnapshotService {
+  pub fn new(data_root: impl Into<PathBuf>) -> Self {
+    Self { data_root: data_root.into() }
+  }
+
+  pub fn user_dir(&self, uid: i64) -> PathBuf {
+    self.data_root.join(uid.to_string())
+  }
+
+  /// Assembles a full snapshot by copying both the SQLite database and collab_db,
+  /// then computing checksums for each output.
+  ///
+  /// Returns a `SnapshotManifest` containing sha256 checksums for all copied files.
+  ///
+  /// **PRECONDITION:** Callers must have paused SQLite writers and closed the
+  /// `collab_db` handle before calling this function. The app-wide quiesce that
+  /// guarantees this is a caller (Plan 2) concern. Without these preconditions:
+  /// - The SQLite database may have concurrent writers, causing `VACUUM INTO` to fail
+  /// - RocksDB background threads may mutate collab_db files during the copy, corrupting the snapshot
+  ///
+  /// # Arguments
+  /// * `user_dir` - Source user directory containing `flowy-database.db` and `collab_db/`
+  /// * `staging_dir` - Target directory where the snapshot will be assembled
+  ///
+  /// # Returns
+  /// A `SnapshotManifest` with checksums for each copied output, or an error.
+  pub fn snapshot(&self, user_dir: &Path, staging_dir: &Path) -> Result<SnapshotManifest, BackupError> {
+    std::fs::create_dir_all(staging_dir)?;
+
+    let mut checksums = BTreeMap::new();
+
+    // Snapshot the SQLite database
+    let src_sqlite = user_dir.join("flowy-database.db");
+    let out_sqlite = staging_dir.join("flowy-database.db");
+    snapshot_sqlite(&src_sqlite, &out_sqlite)?;
+    let sqlite_checksum = compute_sha256_file(&out_sqlite)?;
+    checksums.insert("flowy-database.db".to_string(), sqlite_checksum);
+
+    // Snapshot the collab_db directory
+    let src_collab_db = user_dir.join("collab_db");
+    let out_collab_db = staging_dir.join("collab_db");
+    snapshot_closed_collab_db(&src_collab_db, &out_collab_db)?;
+    let collab_db_checksum = compute_sha256_dir(&out_collab_db)?;
+    checksums.insert("collab_db".to_string(), collab_db_checksum);
+
+    Ok(SnapshotManifest { checksums })
+  }
+
+  /// Restores a snapshot from a staging directory into a target user directory,
+  /// verifying checksums BEFORE copying to prevent corruption on mismatch.
+  ///
+  /// This function first verifies the sha256 checksums of `flowy-database.db` and
+  /// `collab_db/` in the staging directory against the provided manifest. Only if
+  /// all checksums match does it proceed to copy the files into the target directory.
+  /// If any checksum mismatch is detected, the restoration fails with an error and
+  /// no files are written to the target directory (verify-before-copy semantics).
+  ///
+  /// **Staging semantics:** This function only copies files; the actual atomic
+  /// swap into the live app directories is a launch-time concern (Plan 2).
+  ///
+  /// # Arguments
+  /// * `staging_dir` - Source directory containing the snapshot (produced by `snapshot()`)
+  /// * `target_dir` - Target directory where files will be copied (should be empty or non-existent)
+  /// * `manifest` - `SnapshotManifest` containing expected checksums for verification
+  ///
+  /// # Returns
+  /// `Ok(())` if restoration succeeds and all checksums match, or an error otherwise.
+  /// On checksum mismatch, returns `BackupError::Snapshot` with a message identifying
+  /// which file failed verification, and target_dir remains untouched.
+  pub fn restore(&self, staging_dir: &Path, target_dir: &Path, manifest: &SnapshotManifest) -> Result<(), BackupError> {
+    // Verify SQLite checksum BEFORE copying
+    let src_sqlite = staging_dir.join("flowy-database.db");
+    let sqlite_checksum = compute_sha256_file(&src_sqlite)?;
+    let expected_sqlite_checksum = manifest
+      .checksums
+      .get("flowy-database.db")
+      .ok_or_else(|| BackupError::Snapshot("Missing checksum for flowy-database.db in manifest".to_string()))?;
+    if sqlite_checksum != *expected_sqlite_checksum {
+      return Err(BackupError::Snapshot(
+        format!("flowy-database.db checksum mismatch: expected {}, got {}", expected_sqlite_checksum, sqlite_checksum)
+      ));
+    }
+
+    // Verify collab_db checksum BEFORE copying
+    let src_collab_db = staging_dir.join("collab_db");
+    let collab_db_checksum = compute_sha256_dir(&src_collab_db)?;
+    let expected_collab_db_checksum = manifest
+      .checksums
+      .get("collab_db")
+      .ok_or_else(|| BackupError::Snapshot("Missing checksum for collab_db in manifest".to_string()))?;
+    if collab_db_checksum != *expected_collab_db_checksum {
+      return Err(BackupError::Snapshot(
+        format!("collab_db checksum mismatch: expected {}, got {}", expected_collab_db_checksum, collab_db_checksum)
+      ));
+    }
+
+    // Both checksums verified; now copy to target
+    std::fs::create_dir_all(target_dir)?;
+
+    // Copy flowy-database.db
+    let dst_sqlite = target_dir.join("flowy-database.db");
+    std::fs::copy(&src_sqlite, &dst_sqlite)?;
+
+    // Copy collab_db directory
+    let dst_collab_db = target_dir.join("collab_db");
+    snapshot_closed_collab_db(&src_collab_db, &dst_collab_db)?;
+
+    Ok(())
+  }
+}
+
+/// Snapshots a SQLite database by running `VACUUM INTO`.
+///
+/// This creates a consistent copy of the database file, including any data
+/// currently in the WAL (Write-Ahead Log) that has not yet been checkpointed
+/// to the main database file. The `VACUUM INTO` command performs an atomic
+/// copy operation that merges WAL-resident data into the output file.
+///
+/// **PRECONDITION:** The database at `db_path` must not be open for writing
+/// during this operation. SQLite will acquire an exclusive lock, which will
+/// fail if another process or thread holds an active connection.
+pub fn snapshot_sqlite(db_path: &Path, out_path: &Path) -> Result<(), BackupError> {
+  let conn = Connection::open(db_path)
+    .map_err(|e| BackupError::Snapshot(e.to_string()))?;
+
+  // Escape single quotes in the output path for the SQL statement
+  let escaped_path = out_path.to_string_lossy().replace('\'', "''");
+  let sql = format!("VACUUM INTO '{}'", escaped_path);
+
+  conn.execute_batch(&sql)
+    .map_err(|e| BackupError::Snapshot(e.to_string()))?;
+
+  Ok(())
+}
+
+/// Recursively copies the quiescent collab_db directory to out_dir.
+///
+/// **PRECONDITION:** Correct only when no CollabKVDB handle is open on collab_db_path.
+/// The app-wide quiesce that guarantees this is a caller (Plan 2) concern.
+/// Without this precondition, RocksDB background threads may mutate files during the copy,
+/// corrupting the snapshot.
+///
+/// When the handle is dropped, RocksDB flushes the WAL and stops all background threads,
+/// making the directory quiescent. This function then performs a byte-for-byte recursive copy.
+pub fn snapshot_closed_collab_db(collab_db_path: &Path, out_dir: &Path) -> Result<(), BackupError> {
+  // Create the output directory if it doesn't exist
+  std::fs::create_dir_all(out_dir)?;
+
+  // Recursively copy all files and subdirectories
+  copy_dir_recursive(collab_db_path, out_dir)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), BackupError> {
+  for entry in std::fs::read_dir(src)? {
+    let entry = entry?;
+    let path = entry.path();
+    let file_name = entry.file_name();
+    let dest_path = dst.join(&file_name);
+
+    if path.is_dir() {
+      std::fs::create_dir_all(&dest_path)?;
+      copy_dir_recursive(&path, &dest_path)?;
+    } else {
+      std::fs::copy(&path, &dest_path)?;
+    }
+  }
+  Ok(())
+}
+
+/// Computes the SHA256 checksum of a file.
+pub fn compute_sha256_file(path: &Path) -> Result<String, BackupError> {
+  let contents = std::fs::read(path)?;
+  let mut hasher = Sha256::new();
+  hasher.update(&contents);
+  let result = hasher.finalize();
+  Ok(format!("{:x}", result))
+}
+
+/// Computes the SHA256 checksum of a directory by hashing all files in sorted order.
+/// This ensures consistent checksums across snapshots of the same data.
+pub fn compute_sha256_dir(path: &Path) -> Result<String, BackupError> {
+  let mut hasher = Sha256::new();
+  let mut entries: Vec<_> = std::fs::read_dir(path)?
+    .collect::<Result<Vec<_>, _>>()?;
+  entries.sort_by_key(|e| e.path());
+
+  for entry in entries {
+    let path = entry.path();
+    if path.is_file() {
+      let contents = std::fs::read(&path)?;
+      hasher.update(&contents);
+    } else if path.is_dir() {
+      let dir_checksum = compute_sha256_dir(&path)?;
+      hasher.update(dir_checksum.as_bytes());
+    }
+  }
+
+  let result = hasher.finalize();
+  Ok(format!("{:x}", result))
+}

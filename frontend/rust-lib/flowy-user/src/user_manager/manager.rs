@@ -122,6 +122,24 @@ impl UserManager {
     }
   }
 
+  pub fn clear_workspace_awareness(&self, workspace_id: &Uuid) {
+    self.user_awareness_by_workspace.remove(workspace_id);
+  }
+
+  pub fn close_collab_db(&self, user_id: i64) -> Result<(), FlowyError> {
+    self.authenticate_user.database.close_collab_db(user_id)
+  }
+
+  pub async fn reinit_user_awareness(
+    &self,
+    uid: i64,
+    user_uuid: &Uuid,
+    workspace_id: &Uuid,
+    workspace_type: &flowy_user_pub::entities::WorkspaceType,
+  ) -> FlowyResult<()> {
+    self.initial_user_awareness(uid, user_uuid, workspace_id, workspace_type).await
+  }
+
   pub fn get_store_preferences(&self) -> Weak<KVStorePreferences> {
     Arc::downgrade(&self.store_preferences)
   }

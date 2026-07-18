@@ -93,6 +93,15 @@ impl DocumentManager {
       .ok_or_else(FlowyError::ref_drop)
   }
 
+  /// Close the document collab objects without reopening (used during backup quiesce).
+  /// This clears the document cache to ensure any open documents drop their references.
+  pub async fn close_for_backup(&self) -> FlowyResult<()> {
+    trace!("closing document manager for backup");
+    self.documents.clear();
+    self.removing_documents.clear();
+    Ok(())
+  }
+
   /// Get the encoded collab of the document.
   pub async fn get_encoded_collab_with_view_id(&self, doc_id: &Uuid) -> FlowyResult<EncodedCollab> {
     let uid = self.user_service.user_id()?;

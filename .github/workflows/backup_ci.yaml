@@ -1,0 +1,57 @@
+name: Backup Branch Compile Check
+
+# Minimal CI to compile-verify the Google Drive backup feature branch on a real
+# toolchain (the feature was authored in an env that couldn't build flowy-core).
+# Only `cargo check` (full type/borrow check, generates protobuf via the `dart`
+# feature) + the flowy-backup unit tests. No AppFlowy Cloud, no docker, no tests
+# that need external infra.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "feat/google-drive-backup"
+    paths:
+      - "frontend/rust-lib/**"
+      - ".github/workflows/backup_ci.yaml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.85.0"
+
+jobs:
+  compile-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maximize build space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          override: true
+          profile: minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ runner.os }}
+          cache-on-failure: true
+          workspaces: |
+            frontend/rust-lib
+
+      - name: cargo check (compiles flowy-core + all crates with dart-feature codegen)
+        working-directory: frontend/rust-lib
+        run: cargo check --no-default-features --features="dart"
+
+      - name: flowy-backup unit tests (Plan 1 snapshot core)
+        working-directory: frontend/rust-lib
+        run: cargo test -p flowy-backup

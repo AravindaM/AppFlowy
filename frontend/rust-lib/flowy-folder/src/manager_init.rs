@@ -12,6 +12,21 @@ use tracing::{Level, event, info};
 use uuid::Uuid;
 
 impl FolderManager {
+  /// Close the folder collab object without reopening (used during backup quiesce).
+  /// This ensures the Folder's internal collab object is dropped so it stops listening
+  /// and won't interfere with the snapshot.
+  pub async fn close_for_backup(&self) -> FlowyResult<()> {
+    if let Some(old_folder) = self.mutex_folder.swap(None) {
+      let old_folder = old_folder.read().await;
+      old_folder.close();
+      info!(
+        "closed folder for backup: {}",
+        old_folder.get_workspace_id().unwrap_or_default()
+      );
+    }
+    Ok(())
+  }
+
   /// Called immediately after the application launched if the user already sign in/sign up.
   #[tracing::instrument(level = "info", skip(self, initial_data), err)]
   pub async fn initialize(

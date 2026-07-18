@@ -2,6 +2,7 @@
 members = [
   "lib-dispatch",
   "lib-log",
+  "flowy-backup",
   "flowy-core",
   "dart-ffi",
   "flowy-user",
@@ -45,6 +46,7 @@ flowy-derive = { path = "build-tool/flowy-derive" }
 flowy-core = { path = "flowy-core" }
 dart-ffi = { path = "dart-ffi" }
 flowy-user = { path = "flowy-user" }
+flowy-backup = { path = "flowy-backup" }
 flowy-user-pub = { path = "flowy-user-pub" }
 flowy-sqlite = { path = "flowy-sqlite" }
 flowy-folder = { path = "flowy-folder" }
@@ -68,6 +70,8 @@ flowy-ai-pub = { path = "flowy-ai-pub" }
 anyhow = "1.0"
 arc-swap = "1.7"
 tracing = "0.1.40"
+thiserror = "1.0"
+tempfile = "3"
 bytes = "1.5.0"
 serde_json = "1.0.108"
 serde = "1.0.194"
@@ -104,6 +108,7 @@ derive_builder = "0.20.2"
 tantivy = { version = "0.24.1" }
 num_enum = "0.7.3"
 flowy-sqlite-vec = { path = "flowy-sqlite-vec" }
+rusqlite = { version = "0.35.0", features = ["bundled"] }
 
 # Please using the following command to update the revision id
 # Current directory: frontend

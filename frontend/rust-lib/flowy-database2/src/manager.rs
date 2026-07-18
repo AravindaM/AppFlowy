@@ -94,6 +94,24 @@ impl DatabaseManager {
     self.collab_builder.upgrade().ok_or(FlowyError::ref_drop())
   }
 
+  /// Close the database collab objects without reopening (used during backup quiesce).
+  /// This closes all editors and the workspace database to ensure they drop their
+  /// collab references and stop interfering with the snapshot.
+  pub async fn close_for_backup(&self) -> FlowyResult<()> {
+    self.task_scheduler.write().await.clear_task();
+    for (_, editor) in self.editors.lock().await.iter() {
+      editor.close_all_views().await;
+    }
+    self.editors.lock().await.clear();
+    self.removing_editor.lock().await.clear();
+    if let Some(old_workspace_database) = self.workspace_database_manager.swap(None) {
+      info!("Closed workspace database for backup");
+      let wdb = old_workspace_database.read().await;
+      wdb.close();
+    }
+    Ok(())
+  }
+
   /// When initialize with new workspace, all the resources will be cleared.
   pub async fn initialize(&self, uid: i64, is_local_user: bool) -> FlowyResult<()> {
     // 1. Clear all existing tasks
