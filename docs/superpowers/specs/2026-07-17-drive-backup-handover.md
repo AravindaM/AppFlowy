@@ -81,7 +81,7 @@ Full progress ledger: `.superpowers/sdd/progress.md`. Per-task reports: `.superp
 
 ### Status Summary
 - **FIX 1 (CRITICAL — quiesce doesn't quiesce):** ✅ **IMPLEMENTED**
-- **FIX 2 (CRITICAL — backup event dead on arrival):** ⚠️ **PARTIAL** (see below)
+- **FIX 2 (CRITICAL — backup event dead on arrival):** ✅ **IMPLEMENTED** (flowy-core registration approach)
 - **FIX 3 (CRITICAL — reopen failures report success):** ✅ **IMPLEMENTED**
 - **FIX 4 (HIGH — swallowed storage error):** ✅ **IMPLEMENTED**
 
@@ -102,30 +102,46 @@ Full progress ledger: `.superpowers/sdd/progress.md`. Per-task reports: `.superp
 2. `flowy-database2/src/manager.rs`: `DatabaseManager::close_for_backup() -> FlowyResult<()>`
 3. `flowy-document/src/manager.rs`: `DocumentManager::close_for_backup() -> FlowyResult<()>`
 
-### FIX 2 — Backup Event Registration (PARTIAL — DEFERRED TO DART-FFI)
+### FIX 2 — Backup Event Registration (IMPLEMENTED — flowy-core approach)
 
-**Current state:** Backup coordinator global is re-enabled and properly documented.
+**Current state:** BackupWorkspace event fully migrated to flowy-core. Global bridge eliminated entirely.
 
 **What changed:**
-- `flowy-core/src/backup_coordinator.rs`: Restored `set_app_flowy_core()` function (renamed from internal name for clarity)
-- `AppFlowyCore::initialize_backup(core: Arc<Self>)` method exists and calls `backup_coordinator::set_app_flowy_core(core_weak)`
-- `backup_coordinator::run_workspace_backup()` now returns `WorkspaceBackupResult` instead of `SnapshotManifest`
-- flowy-user event handler updated to call coordinator and log reopen status
+- **New file:** `flowy-core/src/backup_event.rs` — AFPlugin with backup event handler
+  - Handler receives 5 managers + config via AFPlugin `.state()` injection pattern (same as folder/document/database plugins)
+  - State params: `Weak<UserManager>`, `Weak<FolderManager>`, `Weak<DatabaseManager>`, `Weak<DocumentManager>`, `Weak<StorageManager>`, `Arc<AppFlowyCoreConfig>`
+  - Calls `execute_workspace_backup()` standalone function (extracted backup logic)
+  
+- **Updated:** `flowy-core/src/module.rs` 
+  - Signature: `make_plugins(..., config: Arc<AppFlowyCoreConfig>)` — now receives config to pass to backup plugin
+  - Plugin registration: adds `backup_event::init(...)` with all managers + config to plugins vector
+  
+- **Removed:** `flowy-core/src/backup_coordinator.rs` — deleted entirely
+  - Global static bridge `BACKUP_COORDINATOR` eliminated
+  - No init-order footgun, no unreachable initialization
+  
+- **Removed from** `AppFlowyCore` (`lib.rs`):
+  - `initialize_backup()` method — no longer needed
+  - `mod backup_coordinator` — cleaned up
+  
+- **Removed from** flowy-user:
+  - `BackupWorkspace` event from `event_map.rs` (UserEvent enum)
+  - `backup_workspace_handler()` from `event_handler.rs`
 
-**Why not the "recommended" fix (flowy-core registration)?**
-The recommended fix (register event in flowy-core) requires passing an `Arc<AppFlowyCore>` weak ref to the plugin system during initialization. But plugins are registered in `make_plugins()` BEFORE `AppFlowyCore::Self` is constructed, creating a chicken-and-egg problem. Flowy-core's AFPluginDispatcher cannot be modified after creation to add new plugins.
+**Why this approach works:**
+Managers ARE created before `make_plugins()` is called (see `AppFlowyCore::init()` line 323–426). By passing `Arc<AppFlowyCoreConfig>` at plugin-creation time, the backup plugin gets access to all dependencies via state injection — the same pattern all other plugins use. No circular reference (Weak refs are used), no global state, testable.
 
-**Pragmatic solution (architect's "Alternative A"):**
-The backup_coordinator is initialized via `AppFlowyCore::initialize_backup(core)`, which **must be called from dart-ffi after wrapping AppFlowyCore in Arc<>**. This is the responsibility of the FFI layer, not Rust. Once initialized, the event handler in flowy-user can access `AppFlowyCore` through the global coordinator.
+**Commit:** `refactor(core): register BackupWorkspace event in flowy-core, remove global backup_coordinator bridge (COMPILE-UNVERIFIED)`
 
-**Action required at dart-ffi level:**
-```
-// After creating AppFlowyCore and wrapping in Arc:
-let core = Arc::new(AppFlowyCore::new(...).await);
-core.initialize_backup(core.clone()).await;  // ← MUST ADD THIS CALL
-```
+**Upstream methods (merge-friendly — no changes to upstream):**
+- None — this is a pure flowy-core refactor. `run_workspace_backup()` method remains on `AppFlowyCore` for compatibility.
 
-**Verification checkpoint:** Task 5 (running-app verification) will confirm the backup event successfully triggers `run_workspace_backup`.
+**Verification checkpoint (COMPILE-UNVERIFIED):**
+- [ ] AFPlugin registration pattern compiles (state injection for 5 weak refs + 1 Arc config)
+- [ ] `execute_workspace_backup()` function receives correct manager types and config
+- [ ] `BackupWorkspacePB` import from `flowy_user::entities` resolves
+- [ ] `make_plugins()` call in `AppFlowyCore::init()` updated to pass config
+- [ ] No dangling references to `backup_coordinator` or `initialize_backup`
 
 ### FIX 3 — Partial-Success Return Type (IMPLEMENTED)
 
