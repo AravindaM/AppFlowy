@@ -205,6 +205,16 @@ Managers ARE created before `make_plugins()` is called (see `AppFlowyCore::init(
 
 ### Future Work (Out of Scope)
 
-- **FIX 2 proper (flowy-core event registration):** Requires refactoring plugin initialization to support lazy registration, or restructuring AppFlowyCore construction to defer plugin setup.
-- **Closed-handle witness token (architect recommendation for FIX 4):** Add a sealed token type that can only be created by `close_collab_db()` and required by `snapshot()` to guarantee precondition.
+- **Closed-handle witness token (architect recommendation):** Add a sealed token type that can only be created by `close_collab_db()` and required by `snapshot()` to enforce the precondition at the type level (currently doc-only).
 - **Task 5 (running-app verification):** Must be done after successful compilation. See plan Task 5 steps in docs/superpowers/plans/2026-07-16-drive-backup-plan-2-app-quiesce.md.
+
+## Current state (2026-07-18) — after architect review, fix pass, CRITICAL 2 refactor, and security fix
+
+All below is COMPILE-UNVERIFIED (env can't build flowy-core). Resolved:
+- **CRITICAL 2 (dead-on-arrival event / global-bridge anti-pattern):** ✅ `backup_coordinator.rs` deleted; `BackupWorkspace` event registered in `flowy-core/src/backup_event.rs` via the standard AFPlugin state-injection pattern (commits 067dc3c, ccfbfef).
+- **CRITICAL 3 (reopen failures reported success):** ✅ `WorkspaceBackupResult { manifest, reopen_ok, reopen_error }` (commit 6de5d78).
+- **HIGH (storage error swallowed):** ✅ explicit warn (commit 6de5d78).
+- **CRITICAL 1 (quiesce doesn't quiesce):** 🟡 `close_for_backup()` on Folder/Database/Document managers, called before `close_collab_db` (commit 6de5d78) — **efficacy still gated on Task 5** (adversarial "backup while typing").
+- **SECURITY — HIGH path traversal** (renderer-supplied `staging_dir` → arbitrary DB write): ✅ removed `staging_dir` from `BackupWorkspacePB`; staging dir now derived backend-side at `{storage_path}/backups/staging/<uuid>` in `execute_workspace_backup`. Dead duplicate `AppFlowyCore::run_workspace_backup` removed (commit 3d806cc).
+
+Still to do on a real dev env: compile + fix nits (note: `Uuid::new_v4()` needs the `v4` uuid feature — confirmed enabled workspace-wide); verify the AFPlugin backup registration wires the 6 state params; run Task 5. Plans 3 (Drive/OAuth), 4 (UI), 5 (restore-on-launch) remain unstarted.
