@@ -20,7 +20,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 use sysinfo::System;
 use tokio::sync::RwLock;
-use tracing::{debug, error, event, info, instrument, warn};
+use tracing::{debug, error, event, info, instrument};
 use uuid::Uuid;
 use flowy_backup::SnapshotManifest;
 
@@ -68,9 +68,6 @@ pub struct WorkspaceBackupResult {
   pub reopen_ok: bool,
   pub reopen_error: Option<String>,
 }
-
-// Re-export for FFI and public API
-pub use self::WorkspaceBackupResult;
 
 #[derive(Clone)]
 pub struct AppFlowyCore {

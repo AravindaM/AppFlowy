@@ -8,6 +8,9 @@ edition = "2018"
 [dependencies]
 lib-dispatch = { workspace = true }
 lib-log = { workspace = true }
+flowy-derive.workspace = true
+strum_macros = "0.25.2"
+flowy-backup = { workspace = true }
 flowy-user = { workspace = true }
 flowy-user-pub = { workspace = true }
 flowy-folder = { workspace = true }

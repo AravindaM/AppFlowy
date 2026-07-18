@@ -1,62 +1,57 @@
 use std::sync::{Arc, Weak};
 use flowy_backup::SnapshotManifest;
-use flowy_error::FlowyResult;
+use flowy_derive::Flowy_Event;
+use flowy_error::{FlowyError, FlowyResult};
 use flowy_user::user_manager::UserManager;
 use flowy_folder::manager::FolderManager;
 use flowy_database2::DatabaseManager;
 use flowy_document::manager::DocumentManager;
 use flowy_storage::manager::StorageManager;
 use lib_dispatch::prelude::*;
-use lib_infra::async_trait::async_trait;
+use strum_macros::Display;
 
 use crate::config::AppFlowyCoreConfig;
 use crate::WorkspaceBackupResult;
-use flowy_user_pub::entities::UserPaths;
-use flowy_user::entities::BackupWorkspacePB;
 use uuid::Uuid;
 use tracing::{debug, error, warn};
 
-pub fn init(
-  user_manager: Weak<UserManager>,
-  folder_manager: Weak<FolderManager>,
-  database_manager: Weak<DatabaseManager>,
-  document_manager: Weak<DocumentManager>,
-  storage_manager: Weak<StorageManager>,
-  config: Arc<AppFlowyCoreConfig>,
-) -> AFPlugin {
+/// All dependencies the backup handler needs, bundled into a single injected
+/// state. lib-dispatch's `AFPluginHandler` only supports up to 5 handler
+/// params, so the managers + config are grouped here rather than injected
+/// individually.
+pub struct BackupPluginState {
+  pub user_manager: Weak<UserManager>,
+  pub folder_manager: Weak<FolderManager>,
+  pub database_manager: Weak<DatabaseManager>,
+  pub document_manager: Weak<DocumentManager>,
+  pub storage_manager: Weak<StorageManager>,
+  pub config: Arc<AppFlowyCoreConfig>,
+}
+
+pub fn init(state: BackupPluginState) -> AFPlugin {
   AFPlugin::new()
     .name("Flowy-Backup")
-    .state(user_manager)
-    .state(folder_manager)
-    .state(database_manager)
-    .state(document_manager)
-    .state(storage_manager)
-    .state(config)
+    .state(state)
     .event(BackupEvent::BackupWorkspace, backup_workspace_handler)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Display, Hash, Flowy_Event)]
+#[event_err = "FlowyError"]
 pub enum BackupEvent {
-  #[event(input = "BackupWorkspacePB")]
+  #[event()]
   BackupWorkspace = 0,
 }
 
 pub async fn backup_workspace_handler(
-  _params: AFPluginData<BackupWorkspacePB>,
-  user_manager: AFPluginState<Weak<UserManager>>,
-  folder_manager: AFPluginState<Weak<FolderManager>>,
-  database_manager: AFPluginState<Weak<DatabaseManager>>,
-  document_manager: AFPluginState<Weak<DocumentManager>>,
-  storage_manager: AFPluginState<Weak<StorageManager>>,
-  config: AFPluginState<Arc<AppFlowyCoreConfig>>,
+  state: AFPluginState<BackupPluginState>,
 ) -> Result<(), FlowyError> {
   let backup_result = execute_workspace_backup(
-    user_manager.as_ref().clone(),
-    folder_manager.as_ref().clone(),
-    database_manager.as_ref().clone(),
-    document_manager.as_ref().clone(),
-    storage_manager.as_ref().clone(),
-    config.as_ref().clone(),
+    state.user_manager.clone(),
+    state.folder_manager.clone(),
+    state.database_manager.clone(),
+    state.document_manager.clone(),
+    state.storage_manager.clone(),
+    state.config.clone(),
   )
   .await?;
 
@@ -118,8 +113,9 @@ pub async fn execute_workspace_backup(
 
   // Get user paths for snapshot location
   let data_root = config.storage_path.clone();
-  let user_paths = UserPaths::new(data_root.clone());
-  let user_dir = std::path::PathBuf::from(user_paths.user_data_dir(user_id));
+  // user data dir layout is `{data_root}/{uid}` (matches UserPaths::user_data_dir,
+  // which is not public to this crate).
+  let user_dir = std::path::PathBuf::from(&data_root).join(user_id.to_string());
 
   // SECURITY: the snapshot staging directory is derived here, backend-side, under
   // the app data root — never supplied by the caller/renderer. Accepting a caller
@@ -155,7 +151,9 @@ pub async fn execute_workspace_backup(
 
     // Step 4: Take snapshot while collab_db is closed
     let snapshot_service = flowy_backup::SnapshotService::new(&data_root);
-    let manifest = snapshot_service.snapshot(&user_dir, &staging_dir)?;
+    let manifest = snapshot_service
+      .snapshot(&user_dir, &staging_dir)
+      .map_err(|e| FlowyError::internal().with_context(format!("backup snapshot failed: {e}")))?;
     debug!("Snapshot completed");
 
     Ok::<SnapshotManifest, FlowyError>(manifest)
@@ -191,13 +189,10 @@ pub async fn execute_workspace_backup(
       .await?;
     debug!("Reinitialized document manager");
 
-    // FIX 4: Log storage manager init failures explicitly
-    if let Err(err) = storage_manager
+    // storage manager reinit returns unit; it logs its own failures internally
+    storage_manager
       .initialize_after_open_workspace(&workspace_id)
-      .await
-    {
-      warn!("Storage manager initialization after backup failed: {:?}", err);
-    }
+      .await;
     debug!("Reinitialized storage manager");
 
     // Re-run user awareness initialization using the public wrapper

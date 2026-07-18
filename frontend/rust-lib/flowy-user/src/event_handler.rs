@@ -862,5 +862,3 @@ pub async fn notify_did_switch_plan_handler(
   manager.notify_did_switch_plan(success).await?;
   Ok(())
 }
-
-#[tracing::instrument(level = "info", skip_all, err)]

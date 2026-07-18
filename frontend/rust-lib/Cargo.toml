@@ -46,6 +46,7 @@ flowy-derive = { path = "build-tool/flowy-derive" }
 flowy-core = { path = "flowy-core" }
 dart-ffi = { path = "dart-ffi" }
 flowy-user = { path = "flowy-user" }
+flowy-backup = { path = "flowy-backup" }
 flowy-user-pub = { path = "flowy-user-pub" }
 flowy-sqlite = { path = "flowy-sqlite" }
 flowy-folder = { path = "flowy-folder" }

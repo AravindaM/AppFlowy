@@ -30,14 +30,14 @@ pub fn make_plugins(
   let search_plugin = flowy_search::event_map::init(search_manager);
   let ai_plugin = flowy_ai::event_map::init(ai_manager);
   let file_storage_plugin = flowy_storage::event_map::init(file_storage_manager.clone());
-  let backup_plugin = backup_event::init(
-    user_session,
+  let backup_plugin = backup_event::init(backup_event::BackupPluginState {
+    user_manager: user_session,
     folder_manager,
     database_manager,
-    document_manager2,
-    file_storage_manager,
+    document_manager: document_manager2,
+    storage_manager: file_storage_manager,
     config,
-  );
+  });
   vec![
     user_plugin,
     folder_plugin,
